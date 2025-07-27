@@ -2,16 +2,24 @@ package orchestrator
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"net/url"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	_ "github.com/lib/pq" // PostgreSQL driver
 	"github.com/nixlim/codedoc-mcp-server/internal/orchestrator/services"
 	"github.com/nixlim/codedoc-mcp-server/internal/orchestrator/session"
 	"github.com/nixlim/codedoc-mcp-server/internal/orchestrator/todolist"
 	"github.com/nixlim/codedoc-mcp-server/internal/orchestrator/workflow"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 // Mock implementations for testing
@@ -19,64 +27,47 @@ type mockSessionManager struct {
 	mock.Mock
 }
 
-// mockSession implements session.Session but can wrap any value
-type mockSession struct {
-	value interface{}
-}
-
-func (m *mockSession) GetID() string {
-	if s, ok := m.value.(string); ok {
-		return s
-	}
-	return ""
-}
-
-func (m *mockSession) GetWorkspaceID() string            { return "" }
-func (m *mockSession) GetProjectPath() string            { return "" }
-func (m *mockSession) IsExpired() bool                   { return false }
-func (m *mockSession) GetCurrentFile() string            { return "" }
-func (m *mockSession) GetStatistics() session.Statistics { return session.Statistics{} }
-func (m *mockSession) AddEvent(event session.Event)      {}
-func (m *mockSession) GetProgress() (int, int)           { return 0, 0 }
-
-func (m *mockSessionManager) Create(ctx context.Context, sess session.Session) error {
-	args := m.Called(ctx, sess)
-	return args.Error(0)
-}
-
-func (m *mockSessionManager) Get(ctx context.Context, sessionID string) (session.Session, error) {
-	args := m.Called(ctx, sessionID)
+func (m *mockSessionManager) Create(workspaceID, moduleName string, filePaths []string) (*session.Session, error) {
+	args := m.Called(workspaceID, moduleName, filePaths)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
-	// Return the raw value - let the calling code handle type assertion
-	if sess, ok := args.Get(0).(session.Session); ok {
-		return sess, args.Error(1)
-	}
-	// Return a mock session that implements the interface but with the wrong type
-	return &mockSession{value: args.Get(0)}, args.Error(1)
+	return args.Get(0).(*session.Session), args.Error(1)
 }
 
-func (m *mockSessionManager) Update(ctx context.Context, sess session.Session) error {
-	args := m.Called(ctx, sess)
-	return args.Error(0)
-}
-
-func (m *mockSessionManager) Delete(ctx context.Context, sessionID string) error {
-	args := m.Called(ctx, sessionID)
-	return args.Error(0)
-}
-
-func (m *mockSessionManager) List(ctx context.Context) ([]session.Session, error) {
-	args := m.Called(ctx)
+func (m *mockSessionManager) Get(id uuid.UUID) (*session.Session, error) {
+	args := m.Called(id)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
-	return args.Get(0).([]session.Session), args.Error(1)
+	return args.Get(0).(*session.Session), args.Error(1)
 }
 
-func (m *mockSessionManager) CleanupExpired(ctx context.Context) error {
-	args := m.Called(ctx)
+func (m *mockSessionManager) Update(id uuid.UUID, updates session.SessionUpdate) error {
+	args := m.Called(id, updates)
+	return args.Error(0)
+}
+
+func (m *mockSessionManager) Delete(id uuid.UUID) error {
+	args := m.Called(id)
+	return args.Error(0)
+}
+
+func (m *mockSessionManager) List(filter session.SessionFilter) ([]*session.Session, error) {
+	args := m.Called(filter)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]*session.Session), args.Error(1)
+}
+
+func (m *mockSessionManager) ExpireSessions() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+func (m *mockSessionManager) Shutdown() error {
+	args := m.Called()
 	return args.Error(0)
 }
 
@@ -147,6 +138,90 @@ func (m *mockTodoManager) DeleteList(ctx context.Context, sessionID string) erro
 }
 
 // Test helper functions
+func createMockSession(id, workspaceID, moduleName string) *session.Session {
+	return &session.Session{
+		ID:          uuid.MustParse(id),
+		WorkspaceID: workspaceID,
+		ModuleName:  moduleName,
+		Status:      session.StatusPending,
+		FilePaths:   []string{},
+		Progress:    session.Progress{},
+		Notes:       []session.SessionNote{},
+		Version:     1,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+		ExpiresAt:   time.Now().Add(24 * time.Hour),
+	}
+}
+
+// setupTestDatabase creates a PostgreSQL testcontainer and returns the connection string
+func setupTestDatabase(ctx context.Context, t *testing.T) (testcontainers.Container, string, func()) {
+	postgresContainer, err := postgres.Run(ctx,
+		"postgres:15-alpine",
+		postgres.WithDatabase("testdb"),
+		postgres.WithUsername("testuser"),
+		postgres.WithPassword("testpass"),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(30*time.Second)),
+	)
+	if err != nil {
+		t.Fatalf("failed to start postgres container: %v", err)
+	}
+
+	connStr, err := postgresContainer.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("failed to get connection string: %v", err)
+	}
+
+	cleanup := func() {
+		if err := postgresContainer.Terminate(ctx); err != nil {
+			t.Logf("failed to terminate postgres container: %v", err)
+		}
+	}
+
+	return postgresContainer, connStr, cleanup
+}
+
+// setupTestDatabaseWithSchema creates a test database and initializes it with schema
+func setupTestDatabaseWithSchema(ctx context.Context, t *testing.T) (*sql.DB, func()) {
+	_, connStr, cleanup := setupTestDatabase(ctx, t)
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		cleanup()
+		t.Fatalf("failed to open database: %v", err)
+	}
+
+	// Create the sessions table for testing
+	schema := `
+		CREATE TABLE IF NOT EXISTS documentation_sessions (
+			id UUID PRIMARY KEY,
+			workspace_id VARCHAR(255) NOT NULL,
+			module_name VARCHAR(255) NOT NULL DEFAULT '',
+			status VARCHAR(50) NOT NULL,
+			file_paths TEXT[] NOT NULL DEFAULT '{}',
+			progress JSONB NOT NULL DEFAULT '{"total_files": 0, "processed_files": 0, "failed_files": []}'::jsonb,
+			version INTEGER NOT NULL DEFAULT 1,
+			created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+			updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+			expires_at TIMESTAMP WITH TIME ZONE
+		);
+	`
+
+	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		cleanup()
+		t.Fatalf("failed to create schema: %v", err)
+	}
+
+	return db, func() {
+		db.Close()
+		cleanup()
+	}
+}
+
 func createTestConfig() *Config {
 	return &Config{
 		Database: DatabaseConfig{
@@ -176,6 +251,60 @@ func createTestConfig() *Config {
 			Output: "stdout",
 		},
 	}
+}
+
+// createTestConfigFromConnectionString creates a config from a database connection string
+func createTestConfigFromConnectionString(connStr string) (*Config, error) {
+	// Parse the connection string
+	u, err := url.Parse(connStr)
+	if err != nil {
+		return nil, err
+	}
+
+	host := u.Hostname()
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		return nil, err
+	}
+
+	database := u.Path[1:] // Remove leading slash
+	user := u.User.Username()
+	password, _ := u.User.Password()
+
+	// Extract sslmode from query parameters
+	sslmode := u.Query().Get("sslmode")
+	if sslmode == "" {
+		sslmode = "disable"
+	}
+
+	return &Config{
+		Database: DatabaseConfig{
+			Host:            host,
+			Port:            port,
+			Database:        database,
+			User:            user,
+			Password:        password,
+			SSLMode:         sslmode,
+			MaxOpenConns:    10,
+			MaxIdleConns:    5,
+			ConnMaxLifetime: 5 * time.Minute,
+		},
+		Session: SessionConfig{
+			Timeout:         24 * time.Hour,
+			MaxConcurrent:   10,
+			CleanupInterval: 1 * time.Hour,
+		},
+		Workflow: WorkflowConfig{
+			MaxRetries:        3,
+			RetryDelay:        1 * time.Second,
+			TransitionTimeout: 30 * time.Second,
+		},
+		Logging: LoggingConfig{
+			Level:  "info",
+			Format: "json",
+			Output: "stdout",
+		},
+	}, nil
 }
 
 func createTestOrchestrator(t *testing.T) (*OrchestratorImpl, *mockSessionManager, *mockWorkflowEngine, *mockTodoManager) {
@@ -210,17 +339,20 @@ func TestNewOrchestrator(t *testing.T) {
 	tests := []struct {
 		name    string
 		config  *Config
+		useDB   bool // whether to use a real testcontainer database
 		wantErr bool
 		errMsg  string
 	}{
 		{
-			name:    "valid config",
-			config:  createTestConfig(),
+			name:    "valid config with testcontainer database",
+			config:  nil, // will be set in test
+			useDB:   true,
 			wantErr: false,
 		},
 		{
 			name:    "nil config",
 			config:  nil,
+			useDB:   false,
 			wantErr: true,
 			errMsg:  "failed to load config",
 		},
@@ -231,6 +363,7 @@ func TestNewOrchestrator(t *testing.T) {
 					Port: 5432,
 				},
 			},
+			useDB:   false,
 			wantErr: true,
 			errMsg:  "failed to load config",
 		},
@@ -238,10 +371,32 @@ func TestNewOrchestrator(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			var cleanup func()
+			
+			if tt.useDB {
+				// Set up testcontainer database
+				ctx := context.Background()
+				_, connStr, dbCleanup := setupTestDatabase(ctx, t)
+				cleanup = dbCleanup
+				
+				config, err := createTestConfigFromConnectionString(connStr)
+				if err != nil {
+					t.Fatalf("failed to create config from connection string: %v", err)
+				}
+				tt.config = config
+			}
+
+			// Ensure cleanup happens
+			if cleanup != nil {
+				defer cleanup()
+			}
+
 			o, err := NewOrchestrator(tt.config)
 			if tt.wantErr {
 				assert.Error(t, err)
-				assert.Contains(t, err.Error(), tt.errMsg)
+				if tt.errMsg != "" {
+					assert.Contains(t, err.Error(), tt.errMsg)
+				}
 				assert.Nil(t, o)
 			} else {
 				assert.NoError(t, err)
@@ -277,9 +432,21 @@ func TestStartDocumentation(t *testing.T) {
 				},
 			},
 			setupMocks: func(sm *mockSessionManager, we *mockWorkflowEngine, tm *mockTodoManager) {
-				sm.On("Create", mock.Anything, mock.AnythingOfType("*orchestrator.DocumentationSession")).Return(nil)
-				we.On("Initialize", mock.Anything, mock.AnythingOfType("string"), workflow.WorkflowStateIdle).Return(nil)
-				tm.On("CreateList", mock.Anything, mock.AnythingOfType("string")).Return(nil)
+				// Create a mock session to return
+				mockSess := &session.Session{
+					ID:          uuid.New(),
+					WorkspaceID: "workspace-123",
+					ModuleName:  "/path/to/project",
+					Status:      session.StatusPending,
+					FilePaths:   []string{},
+					Progress:    session.Progress{},
+					CreatedAt:   time.Now(),
+					UpdatedAt:   time.Now(),
+					ExpiresAt:   time.Now().Add(24 * time.Hour),
+				}
+				sm.On("Create", "workspace-123", "/path/to/project", []string{}).Return(mockSess, nil)
+				we.On("Initialize", mock.Anything, mockSess.GetID(), workflow.WorkflowStateIdle).Return(nil)
+				tm.On("CreateList", mock.Anything, mockSess.GetID()).Return(nil)
 			},
 			wantErr: false,
 			verifyResult: func(t *testing.T, sess *DocumentationSession) {
@@ -321,8 +488,8 @@ func TestStartDocumentation(t *testing.T) {
 				ProjectPath: "/path/to/project",
 			},
 			setupMocks: func(sm *mockSessionManager, we *mockWorkflowEngine, tm *mockTodoManager) {
-				sm.On("Create", mock.Anything, mock.AnythingOfType("*orchestrator.DocumentationSession")).
-					Return(errors.New("database error"))
+				sm.On("Create", "workspace-123", "/path/to/project", []string{}).
+					Return(nil, errors.New("database error"))
 			},
 			wantErr: true,
 			errMsg:  "failed to create session",
@@ -334,8 +501,19 @@ func TestStartDocumentation(t *testing.T) {
 				ProjectPath: "/path/to/project",
 			},
 			setupMocks: func(sm *mockSessionManager, we *mockWorkflowEngine, tm *mockTodoManager) {
-				sm.On("Create", mock.Anything, mock.AnythingOfType("*orchestrator.DocumentationSession")).Return(nil)
-				we.On("Initialize", mock.Anything, mock.AnythingOfType("string"), workflow.WorkflowStateIdle).
+				mockSess := &session.Session{
+					ID:          uuid.New(),
+					WorkspaceID: "workspace-123",
+					ModuleName:  "/path/to/project",
+					Status:      session.StatusPending,
+					FilePaths:   []string{},
+					Progress:    session.Progress{},
+					CreatedAt:   time.Now(),
+					UpdatedAt:   time.Now(),
+					ExpiresAt:   time.Now().Add(24 * time.Hour),
+				}
+				sm.On("Create", "workspace-123", "/path/to/project", []string{}).Return(mockSess, nil)
+				we.On("Initialize", mock.Anything, mockSess.GetID(), workflow.WorkflowStateIdle).
 					Return(errors.New("workflow error"))
 			},
 			wantErr: true,
@@ -348,9 +526,20 @@ func TestStartDocumentation(t *testing.T) {
 				ProjectPath: "/path/to/project",
 			},
 			setupMocks: func(sm *mockSessionManager, we *mockWorkflowEngine, tm *mockTodoManager) {
-				sm.On("Create", mock.Anything, mock.AnythingOfType("*orchestrator.DocumentationSession")).Return(nil)
-				we.On("Initialize", mock.Anything, mock.AnythingOfType("string"), workflow.WorkflowStateIdle).Return(nil)
-				tm.On("CreateList", mock.Anything, mock.AnythingOfType("string")).
+				mockSess := &session.Session{
+					ID:          uuid.New(),
+					WorkspaceID: "workspace-123",
+					ModuleName:  "/path/to/project",
+					Status:      session.StatusPending,
+					FilePaths:   []string{},
+					Progress:    session.Progress{},
+					CreatedAt:   time.Now(),
+					UpdatedAt:   time.Now(),
+					ExpiresAt:   time.Now().Add(24 * time.Hour),
+				}
+				sm.On("Create", "workspace-123", "/path/to/project", []string{}).Return(mockSess, nil)
+				we.On("Initialize", mock.Anything, mockSess.GetID(), workflow.WorkflowStateIdle).Return(nil)
+				tm.On("CreateList", mock.Anything, mockSess.GetID()).
 					Return(errors.New("todo error"))
 			},
 			wantErr: true,
@@ -366,9 +555,20 @@ func TestStartDocumentation(t *testing.T) {
 				},
 			},
 			setupMocks: func(sm *mockSessionManager, we *mockWorkflowEngine, tm *mockTodoManager) {
-				sm.On("Create", mock.Anything, mock.AnythingOfType("*orchestrator.DocumentationSession")).Return(nil)
-				we.On("Initialize", mock.Anything, mock.AnythingOfType("string"), workflow.WorkflowStateIdle).Return(nil)
-				tm.On("CreateList", mock.Anything, mock.AnythingOfType("string")).Return(nil)
+				mockSess := &session.Session{
+					ID:          uuid.New(),
+					WorkspaceID: "workspace-123",
+					ModuleName:  "/path/to/project",
+					Status:      session.StatusPending,
+					FilePaths:   []string{},
+					Progress:    session.Progress{},
+					CreatedAt:   time.Now(),
+					UpdatedAt:   time.Now(),
+					ExpiresAt:   time.Now().Add(24 * time.Hour),
+				}
+				sm.On("Create", "workspace-123", "/path/to/project", []string{}).Return(mockSess, nil)
+				we.On("Initialize", mock.Anything, mockSess.GetID(), workflow.WorkflowStateIdle).Return(nil)
+				tm.On("CreateList", mock.Anything, mockSess.GetID()).Return(nil)
 			},
 			wantErr: false,
 			verifyResult: func(t *testing.T, sess *DocumentationSession) {
@@ -436,25 +636,29 @@ func TestGetSession(t *testing.T) {
 	}{
 		{
 			name:      "successful session retrieval",
-			sessionID: "session-123",
+			sessionID: "550e8400-e29b-41d4-a716-446655440000",
 			setupMocks: func(sm *mockSessionManager) *DocumentationSession {
-				sess := &DocumentationSession{
-					ID:          "session-123",
+				id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440000")
+				sess := createMockSession("550e8400-e29b-41d4-a716-446655440000", "workspace-123", "/path/to/project")
+				sm.On("Get", id).Return(sess, nil)
+				// Expected DocumentationSession to return
+				docSess := &DocumentationSession{
+					ID:          "550e8400-e29b-41d4-a716-446655440000",
 					WorkspaceID: "workspace-123",
 					ProjectPath: "/path/to/project",
 					State:       WorkflowStateProcessing,
-					ExpiresAt:   time.Now().Add(1 * time.Hour),
+					ExpiresAt:   sess.ExpiresAt,
 				}
-				sm.On("Get", mock.Anything, "session-123").Return(sess, nil)
-				return sess
+				return docSess
 			},
 			wantErr: false,
 		},
 		{
 			name:      "session not found",
-			sessionID: "nonexistent",
+			sessionID: "550e8400-e29b-41d4-a716-446655440001",
 			setupMocks: func(sm *mockSessionManager) *DocumentationSession {
-				sm.On("Get", mock.Anything, "nonexistent").Return(nil, errors.New("not found"))
+				id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440001")
+				sm.On("Get", id).Return(nil, errors.New("not found"))
 				return nil
 			},
 			wantErr: true,
@@ -462,28 +666,29 @@ func TestGetSession(t *testing.T) {
 		},
 		{
 			name:      "session expired",
-			sessionID: "expired-session",
+			sessionID: "550e8400-e29b-41d4-a716-446655440002",
 			setupMocks: func(sm *mockSessionManager) *DocumentationSession {
-				sess := &DocumentationSession{
-					ID:        "expired-session",
-					ExpiresAt: time.Now().Add(-1 * time.Hour), // Expired
+				id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440002")
+				sess := createMockSession("550e8400-e29b-41d4-a716-446655440002", "workspace-123", "/path/to/project")
+				sess.ExpiresAt = time.Now().Add(-1 * time.Hour) // Expired
+				sm.On("Get", id).Return(sess, nil)
+				return &DocumentationSession{
+					ID:        "550e8400-e29b-41d4-a716-446655440002",
+					ExpiresAt: sess.ExpiresAt,
 				}
-				sm.On("Get", mock.Anything, "expired-session").Return(sess, nil)
-				return sess
 			},
 			wantErr: true,
-			errMsg:  "session expired-session has expired",
+			errMsg:  "session 550e8400-e29b-41d4-a716-446655440002 has expired",
 		},
 		{
-			name:      "invalid session type",
-			sessionID: "invalid-type",
+			name:      "invalid session ID",
+			sessionID: "invalid-uuid",
 			setupMocks: func(sm *mockSessionManager) *DocumentationSession {
-				// Return something that's not a DocumentationSession
-				sm.On("Get", mock.Anything, "invalid-type").Return("not a session", nil)
+				// No mocks needed - parsing will fail
 				return nil
 			},
 			wantErr: true,
-			errMsg:  "invalid session type",
+			errMsg:  "invalid session ID",
 		},
 	}
 
@@ -522,22 +727,17 @@ func TestProcessNextFile(t *testing.T) {
 	}{
 		{
 			name:      "successful file processing",
-			sessionID: "session-123",
+			sessionID: "550e8400-e29b-41d4-a716-446655440100",
 			setupMocks: func(sm *mockSessionManager, we *mockWorkflowEngine, tm *mockTodoManager) {
-				sess := &DocumentationSession{
-					ID:          "session-123",
-					WorkspaceID: "workspace-123",
-					ProjectPath: "/path/to/project",
-					State:       WorkflowStateProcessing,
-					ExpiresAt:   time.Now().Add(1 * time.Hour),
-					Progress: SessionProgress{
-						TotalFiles:     10,
-						ProcessedFiles: 3,
-					},
-				}
-				sm.On("Get", mock.Anything, "session-123").Return(sess, nil)
-				tm.On("GetNext", mock.Anything, "session-123").Return("/path/to/file.go", nil)
-				sm.On("Update", mock.Anything, mock.AnythingOfType("*orchestrator.DocumentationSession")).Return(nil)
+				id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440100")
+				sess := createMockSession("550e8400-e29b-41d4-a716-446655440100", "workspace-123", "/path/to/project")
+				sess.Status = session.StatusInProgress
+				sm.On("Get", id).Return(sess, nil)
+				
+				tm.On("GetNext", mock.Anything, "550e8400-e29b-41d4-a716-446655440100").Return("/path/to/file.go", nil)
+				
+				// For the update call
+				sm.On("Update", id, mock.AnythingOfType("session.SessionUpdate")).Return(nil)
 			},
 			wantErr: false,
 			verifyResult: func(t *testing.T, analysis *FileAnalysis) {
@@ -549,56 +749,50 @@ func TestProcessNextFile(t *testing.T) {
 		},
 		{
 			name:      "session not found",
-			sessionID: "nonexistent",
+			sessionID: "550e8400-e29b-41d4-a716-446655440003",
 			setupMocks: func(sm *mockSessionManager, we *mockWorkflowEngine, tm *mockTodoManager) {
-				sm.On("Get", mock.Anything, "nonexistent").Return(nil, errors.New("not found"))
+				id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440003")
+				sm.On("Get", id).Return(nil, errors.New("not found"))
 			},
 			wantErr: true,
 			errMsg:  "session not found",
 		},
 		{
 			name:      "transition from idle to processing",
-			sessionID: "session-idle",
+			sessionID: "550e8400-e29b-41d4-a716-446655440201",
 			setupMocks: func(sm *mockSessionManager, we *mockWorkflowEngine, tm *mockTodoManager) {
-				sess := &DocumentationSession{
-					ID:        "session-idle",
-					State:     WorkflowStateIdle,
-					ExpiresAt: time.Now().Add(1 * time.Hour),
-					Progress:  SessionProgress{},
-				}
-				sm.On("Get", mock.Anything, "session-idle").Return(sess, nil)
-				we.On("Transition", mock.Anything, "session-idle", workflow.WorkflowStateProcessing).Return(nil)
-				tm.On("GetNext", mock.Anything, "session-idle").Return("/path/to/file.go", nil)
-				sm.On("Update", mock.Anything, mock.AnythingOfType("*orchestrator.DocumentationSession")).Return(nil)
+				id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440201")
+				sess := createMockSession("550e8400-e29b-41d4-a716-446655440201", "workspace-123", "test-module")
+				sess.Status = session.StatusPending // Set to Pending to trigger transition
+				sm.On("Get", id).Return(sess, nil)
+				we.On("Transition", mock.Anything, "550e8400-e29b-41d4-a716-446655440201", workflow.WorkflowStateProcessing).Return(nil)
+				tm.On("GetNext", mock.Anything, "550e8400-e29b-41d4-a716-446655440201").Return("/path/to/file.go", nil)
+				sm.On("Update", id, mock.AnythingOfType("session.SessionUpdate")).Return(nil)
 			},
 			wantErr: false,
 		},
 		{
 			name:      "invalid state transition",
-			sessionID: "session-complete",
+			sessionID: "550e8400-e29b-41d4-a716-446655440202",
 			setupMocks: func(sm *mockSessionManager, we *mockWorkflowEngine, tm *mockTodoManager) {
-				sess := &DocumentationSession{
-					ID:        "session-complete",
-					State:     WorkflowStateComplete,
-					ExpiresAt: time.Now().Add(1 * time.Hour),
-				}
-				sm.On("Get", mock.Anything, "session-complete").Return(sess, nil)
+				id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440202")
+				sess := createMockSession("550e8400-e29b-41d4-a716-446655440202", "workspace-123", "test-module")
+				sess.Status = session.StatusCompleted
+				sm.On("Get", id).Return(sess, nil)
 			},
 			wantErr: true,
-			errMsg:  "cannot transition from complete to processing",
+			errMsg:  "cannot transition from",
 		},
 		{
 			name:      "no more todos",
-			sessionID: "session-empty",
+			sessionID: "550e8400-e29b-41d4-a716-446655440203",
 			setupMocks: func(sm *mockSessionManager, we *mockWorkflowEngine, tm *mockTodoManager) {
-				sess := &DocumentationSession{
-					ID:        "session-empty",
-					State:     WorkflowStateProcessing,
-					ExpiresAt: time.Now().Add(1 * time.Hour),
-				}
-				sm.On("Get", mock.Anything, "session-empty").Return(sess, nil)
-				tm.On("GetNext", mock.Anything, "session-empty").
-					Return("", &todolist.NoMoreTodosError{SessionID: "session-empty"})
+				id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440203")
+				sess := createMockSession("550e8400-e29b-41d4-a716-446655440203", "workspace-123", "test-module")
+				sess.Status = session.StatusInProgress
+				sm.On("Get", id).Return(sess, nil)
+				tm.On("GetNext", mock.Anything, "550e8400-e29b-41d4-a716-446655440203").
+					Return("", &todolist.NoMoreTodosError{SessionID: "550e8400-e29b-41d4-a716-446655440203"})
 			},
 			wantErr: false,
 			verifyResult: func(t *testing.T, analysis *FileAnalysis) {
@@ -607,15 +801,13 @@ func TestProcessNextFile(t *testing.T) {
 		},
 		{
 			name:      "todo manager error",
-			sessionID: "session-error",
+			sessionID: "550e8400-e29b-41d4-a716-446655440204",
 			setupMocks: func(sm *mockSessionManager, we *mockWorkflowEngine, tm *mockTodoManager) {
-				sess := &DocumentationSession{
-					ID:        "session-error",
-					State:     WorkflowStateProcessing,
-					ExpiresAt: time.Now().Add(1 * time.Hour),
-				}
-				sm.On("Get", mock.Anything, "session-error").Return(sess, nil)
-				tm.On("GetNext", mock.Anything, "session-error").
+				id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440204")
+				sess := createMockSession("550e8400-e29b-41d4-a716-446655440204", "workspace-123", "test-module")
+				sess.Status = session.StatusInProgress
+				sm.On("Get", id).Return(sess, nil)
+				tm.On("GetNext", mock.Anything, "550e8400-e29b-41d4-a716-446655440204").
 					Return("", errors.New("database error"))
 			},
 			wantErr: true,
@@ -623,17 +815,14 @@ func TestProcessNextFile(t *testing.T) {
 		},
 		{
 			name:      "session update fails",
-			sessionID: "session-update-fail",
+			sessionID: "550e8400-e29b-41d4-a716-446655440205",
 			setupMocks: func(sm *mockSessionManager, we *mockWorkflowEngine, tm *mockTodoManager) {
-				sess := &DocumentationSession{
-					ID:        "session-update-fail",
-					State:     WorkflowStateProcessing,
-					ExpiresAt: time.Now().Add(1 * time.Hour),
-					Progress:  SessionProgress{},
-				}
-				sm.On("Get", mock.Anything, "session-update-fail").Return(sess, nil)
-				tm.On("GetNext", mock.Anything, "session-update-fail").Return("/path/to/file.go", nil)
-				sm.On("Update", mock.Anything, mock.AnythingOfType("*orchestrator.DocumentationSession")).
+				id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440205")
+				sess := createMockSession("550e8400-e29b-41d4-a716-446655440205", "workspace-123", "test-module")
+				sess.Status = session.StatusInProgress
+				sm.On("Get", id).Return(sess, nil)
+				tm.On("GetNext", mock.Anything, "550e8400-e29b-41d4-a716-446655440205").Return("/path/to/file.go", nil)
+				sm.On("Update", id, mock.AnythingOfType("session.SessionUpdate")).
 					Return(errors.New("update failed"))
 			},
 			wantErr: true,
@@ -678,44 +867,40 @@ func TestCompleteSession(t *testing.T) {
 	}{
 		{
 			name:      "successful session completion",
-			sessionID: "session-123",
+			sessionID: "550e8400-e29b-41d4-a716-446655440300",
 			setupMocks: func(sm *mockSessionManager, we *mockWorkflowEngine, tm *mockTodoManager) {
-				sess := &DocumentationSession{
-					ID:        "session-123",
-					State:     WorkflowStateProcessing,
-					ExpiresAt: time.Now().Add(1 * time.Hour),
-					Progress: SessionProgress{
-						ProcessedFiles: 10,
-						FailedFiles:    2,
-					},
-				}
-				sm.On("Get", mock.Anything, "session-123").Return(sess, nil)
-				we.On("Transition", mock.Anything, "session-123", workflow.WorkflowStateComplete).Return(nil)
-				sm.On("Update", mock.Anything, mock.AnythingOfType("*orchestrator.DocumentationSession")).Return(nil)
-				tm.On("DeleteList", mock.Anything, "session-123").Return(nil)
+				id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440300")
+				sess := createMockSession("550e8400-e29b-41d4-a716-446655440300", "workspace-123", "test-module")
+				sess.Status = session.StatusInProgress
+				sm.On("Get", id).Return(sess, nil)
+				we.On("Transition", mock.Anything, "550e8400-e29b-41d4-a716-446655440300", workflow.WorkflowStateComplete).Return(nil)
+				completedStatus := session.StatusCompleted
+				sm.On("Update", id, mock.MatchedBy(func(update session.SessionUpdate) bool {
+					return update.Status != nil && *update.Status == completedStatus
+				})).Return(nil)
+				tm.On("DeleteList", mock.Anything, "550e8400-e29b-41d4-a716-446655440300").Return(nil)
 			},
 			wantErr: false,
 		},
 		{
 			name:      "session not found",
-			sessionID: "nonexistent",
+			sessionID: "550e8400-e29b-41d4-a716-446655440003",
 			setupMocks: func(sm *mockSessionManager, we *mockWorkflowEngine, tm *mockTodoManager) {
-				sm.On("Get", mock.Anything, "nonexistent").Return(nil, errors.New("not found"))
+				id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440003")
+				sm.On("Get", id).Return(nil, errors.New("not found"))
 			},
 			wantErr: true,
 			errMsg:  "session not found",
 		},
 		{
 			name:      "workflow transition fails",
-			sessionID: "session-fail",
+			sessionID: "550e8400-e29b-41d4-a716-446655440302",
 			setupMocks: func(sm *mockSessionManager, we *mockWorkflowEngine, tm *mockTodoManager) {
-				sess := &DocumentationSession{
-					ID:        "session-fail",
-					State:     WorkflowStateProcessing,
-					ExpiresAt: time.Now().Add(1 * time.Hour),
-				}
-				sm.On("Get", mock.Anything, "session-fail").Return(sess, nil)
-				we.On("Transition", mock.Anything, "session-fail", workflow.WorkflowStateComplete).
+				id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440302")
+				sess := createMockSession("550e8400-e29b-41d4-a716-446655440302", "workspace-123", "test-module")
+				sess.Status = session.StatusInProgress
+				sm.On("Get", id).Return(sess, nil)
+				we.On("Transition", mock.Anything, "550e8400-e29b-41d4-a716-446655440302", workflow.WorkflowStateComplete).
 					Return(errors.New("invalid transition"))
 			},
 			wantErr: true,
@@ -723,16 +908,14 @@ func TestCompleteSession(t *testing.T) {
 		},
 		{
 			name:      "session update fails",
-			sessionID: "session-update-fail",
+			sessionID: "550e8400-e29b-41d4-a716-446655440303",
 			setupMocks: func(sm *mockSessionManager, we *mockWorkflowEngine, tm *mockTodoManager) {
-				sess := &DocumentationSession{
-					ID:        "session-update-fail",
-					State:     WorkflowStateProcessing,
-					ExpiresAt: time.Now().Add(1 * time.Hour),
-				}
-				sm.On("Get", mock.Anything, "session-update-fail").Return(sess, nil)
-				we.On("Transition", mock.Anything, "session-update-fail", workflow.WorkflowStateComplete).Return(nil)
-				sm.On("Update", mock.Anything, mock.AnythingOfType("*orchestrator.DocumentationSession")).
+				id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440303")
+				sess := createMockSession("550e8400-e29b-41d4-a716-446655440303", "workspace-123", "test-module")
+				sess.Status = session.StatusInProgress
+				sm.On("Get", id).Return(sess, nil)
+				we.On("Transition", mock.Anything, "550e8400-e29b-41d4-a716-446655440303", workflow.WorkflowStateComplete).Return(nil)
+				sm.On("Update", id, mock.AnythingOfType("session.SessionUpdate")).
 					Return(errors.New("update failed"))
 			},
 			wantErr: true,
@@ -740,17 +923,18 @@ func TestCompleteSession(t *testing.T) {
 		},
 		{
 			name:      "todo deletion fails but doesn't affect completion",
-			sessionID: "session-todo-fail",
+			sessionID: "550e8400-e29b-41d4-a716-446655440304",
 			setupMocks: func(sm *mockSessionManager, we *mockWorkflowEngine, tm *mockTodoManager) {
-				sess := &DocumentationSession{
-					ID:        "session-todo-fail",
-					State:     WorkflowStateProcessing,
-					ExpiresAt: time.Now().Add(1 * time.Hour),
-				}
-				sm.On("Get", mock.Anything, "session-todo-fail").Return(sess, nil)
-				we.On("Transition", mock.Anything, "session-todo-fail", workflow.WorkflowStateComplete).Return(nil)
-				sm.On("Update", mock.Anything, mock.AnythingOfType("*orchestrator.DocumentationSession")).Return(nil)
-				tm.On("DeleteList", mock.Anything, "session-todo-fail").
+				id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440304")
+				sess := createMockSession("550e8400-e29b-41d4-a716-446655440304", "workspace-123", "test-module")
+				sess.Status = session.StatusInProgress
+				sm.On("Get", id).Return(sess, nil)
+				we.On("Transition", mock.Anything, "550e8400-e29b-41d4-a716-446655440304", workflow.WorkflowStateComplete).Return(nil)
+				completedStatus := session.StatusCompleted
+				sm.On("Update", id, mock.MatchedBy(func(update session.SessionUpdate) bool {
+					return update.Status != nil && *update.Status == completedStatus
+				})).Return(nil)
+				tm.On("DeleteList", mock.Anything, "550e8400-e29b-41d4-a716-446655440304").
 					Return(errors.New("deletion failed"))
 			},
 			wantErr: false, // TODO deletion failure is logged but doesn't fail the operation

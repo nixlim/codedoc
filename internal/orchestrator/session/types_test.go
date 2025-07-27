@@ -1,361 +1,214 @@
 package session
 
 import (
-	"fmt"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 )
 
-func TestEvent(t *testing.T) {
-	t.Run("event creation", func(t *testing.T) {
-		now := time.Now()
-		event := &Event{
-			ID:        "event-123",
-			SessionID: "session-456",
-			Type:      "file_processed",
-			Data: map[string]interface{}{
-				"file":   "/path/to/file.go",
-				"tokens": 1500,
+func TestSessionStatus_Constants(t *testing.T) {
+	// Verify all status constants are defined
+	assert.Equal(t, SessionStatus("pending"), StatusPending)
+	assert.Equal(t, SessionStatus("in_progress"), StatusInProgress)
+	assert.Equal(t, SessionStatus("completed"), StatusCompleted)
+	assert.Equal(t, SessionStatus("failed"), StatusFailed)
+	assert.Equal(t, SessionStatus("expired"), StatusExpired)
+}
+
+func TestSession_GetID(t *testing.T) {
+	sessionID := uuid.New()
+	session := &Session{
+		ID: sessionID,
+	}
+	
+	assert.Equal(t, sessionID.String(), session.GetID())
+}
+
+func TestSession_Structure(t *testing.T) {
+	now := time.Now()
+	sessionID := uuid.New()
+	
+	session := &Session{
+		ID:          sessionID,
+		WorkspaceID: "workspace-123",
+		ModuleName:  "test-module",
+		Status:      StatusPending,
+		FilePaths:   []string{"/path/to/file1.go", "/path/to/file2.go"},
+		Progress: Progress{
+			TotalFiles:     2,
+			ProcessedFiles: 1,
+			CurrentFile:    "/path/to/file1.go",
+			FailedFiles:    []string{},
+		},
+		Notes: []SessionNote{
+			{
+				FilePath:  "/path/to/file1.go",
+				MemoryID:  "memory-123",
+				Status:    "processed",
+				CreatedAt: now,
 			},
-			Timestamp: now,
-		}
-
-		assert.Equal(t, "event-123", event.ID)
-		assert.Equal(t, "session-456", event.SessionID)
-		assert.Equal(t, "file_processed", event.Type)
-		assert.Equal(t, "/path/to/file.go", event.Data["file"])
-		assert.Equal(t, 1500, event.Data["tokens"])
-		assert.Equal(t, now, event.Timestamp)
-	})
-
-	t.Run("event types", func(t *testing.T) {
-		eventTypes := []string{
-			"file_processed",
-			"error",
-			"state_change",
-			"session_start",
-			"session_complete",
-		}
-
-		for _, eventType := range eventTypes {
-			event := &Event{
-				ID:        "test-id",
-				SessionID: "test-session",
-				Type:      eventType,
-				Timestamp: time.Now(),
-			}
-			assert.Equal(t, eventType, event.Type)
-		}
-	})
-
-	t.Run("event data variations", func(t *testing.T) {
-		// Empty data
-		event1 := &Event{
-			ID:        "event-1",
-			SessionID: "session-1",
-			Type:      "test",
-			Data:      nil,
-			Timestamp: time.Now(),
-		}
-		assert.Nil(t, event1.Data)
-
-		// Complex data
-		event2 := &Event{
-			ID:        "event-2",
-			SessionID: "session-2",
-			Type:      "error",
-			Data: map[string]interface{}{
-				"error":   "file not found",
-				"path":    "/missing/file.go",
-				"retries": 3,
-				"metadata": map[string]string{
-					"component": "filesystem",
-					"severity":  "high",
-				},
-			},
-			Timestamp: time.Now(),
-		}
-		assert.NotNil(t, event2.Data)
-		assert.Equal(t, "file not found", event2.Data["error"])
-		metadata := event2.Data["metadata"].(map[string]string)
-		assert.Equal(t, "filesystem", metadata["component"])
-	})
-}
-
-func TestStatistics(t *testing.T) {
-	t.Run("statistics with completed session", func(t *testing.T) {
-		startTime := time.Now()
-		endTime := startTime.Add(30 * time.Minute)
-
-		stats := &Statistics{
-			StartTime:            startTime,
-			EndTime:              &endTime,
-			Duration:             30 * time.Minute,
-			FilesPerMinute:       2.5,
-			AverageTokensPerFile: 1200.5,
-			TotalTokensUsed:      36015,
-		}
-
-		assert.Equal(t, startTime, stats.StartTime)
-		assert.NotNil(t, stats.EndTime)
-		assert.Equal(t, endTime, *stats.EndTime)
-		assert.Equal(t, 30*time.Minute, stats.Duration)
-		assert.Equal(t, 2.5, stats.FilesPerMinute)
-		assert.Equal(t, 1200.5, stats.AverageTokensPerFile)
-		assert.Equal(t, 36015, stats.TotalTokensUsed)
-	})
-
-	t.Run("statistics with ongoing session", func(t *testing.T) {
-		startTime := time.Now()
-
-		stats := &Statistics{
-			StartTime:            startTime,
-			EndTime:              nil,
-			Duration:             15 * time.Minute,
-			FilesPerMinute:       1.8,
-			AverageTokensPerFile: 950.0,
-			TotalTokensUsed:      25650,
-		}
-
-		assert.Equal(t, startTime, stats.StartTime)
-		assert.Nil(t, stats.EndTime)
-		assert.Equal(t, 15*time.Minute, stats.Duration)
-	})
-
-	t.Run("zero statistics", func(t *testing.T) {
-		stats := &Statistics{
-			StartTime:            time.Now(),
-			EndTime:              nil,
-			Duration:             0,
-			FilesPerMinute:       0,
-			AverageTokensPerFile: 0,
-			TotalTokensUsed:      0,
-		}
-
-		assert.Zero(t, stats.Duration)
-		assert.Zero(t, stats.FilesPerMinute)
-		assert.Zero(t, stats.AverageTokensPerFile)
-		assert.Zero(t, stats.TotalTokensUsed)
-	})
-
-	t.Run("statistics calculation", func(t *testing.T) {
-		// Test calculating derived values
-		filesProcessed := 45
-		totalTokens := 54000
-		duration := 30 * time.Minute
-
-		avgTokens := float64(totalTokens) / float64(filesProcessed)
-		filesPerMin := float64(filesProcessed) / duration.Minutes()
-
-		assert.Equal(t, 1200.0, avgTokens)
-		assert.Equal(t, 1.5, filesPerMin)
-	})
-}
-
-// Mock implementation of Repository interface for testing
-type mockRepository struct {
-	events map[string]*Event
-	calls  map[string]int
-}
-
-func newMockRepository() *mockRepository {
-	return &mockRepository{
-		events: make(map[string]*Event),
-		calls:  make(map[string]int),
+		},
+		Version:   1,
+		CreatedAt: now,
+		UpdatedAt: now,
+		ExpiresAt: now.Add(24 * time.Hour),
 	}
+	
+	// Verify structure
+	assert.Equal(t, sessionID, session.ID)
+	assert.Equal(t, "workspace-123", session.WorkspaceID)
+	assert.Equal(t, "test-module", session.ModuleName)
+	assert.Equal(t, StatusPending, session.Status)
+	assert.Len(t, session.FilePaths, 2)
+	assert.Equal(t, 2, session.Progress.TotalFiles)
+	assert.Equal(t, 1, session.Progress.ProcessedFiles)
+	assert.Equal(t, "/path/to/file1.go", session.Progress.CurrentFile)
+	assert.Len(t, session.Notes, 1)
+	assert.Equal(t, 1, session.Version)
 }
 
-func (m *mockRepository) Create(event *Event) error {
-	m.calls["Create"]++
-	m.events[event.ID] = event
-	return nil
-}
-
-func (m *mockRepository) GetByID(id string) (*Event, error) {
-	m.calls["GetByID"]++
-	event, exists := m.events[id]
-	if !exists {
-		return nil, fmt.Errorf("event not found")
+func TestProgress_Structure(t *testing.T) {
+	progress := Progress{
+		TotalFiles:     10,
+		ProcessedFiles: 5,
+		CurrentFile:    "/current/file.go",
+		FailedFiles:    []string{"/failed/file1.go", "/failed/file2.go"},
 	}
-	return event, nil
+	
+	assert.Equal(t, 10, progress.TotalFiles)
+	assert.Equal(t, 5, progress.ProcessedFiles)
+	assert.Equal(t, "/current/file.go", progress.CurrentFile)
+	assert.Len(t, progress.FailedFiles, 2)
 }
 
-func (m *mockRepository) Update(event *Event) error {
-	m.calls["Update"]++
-	if _, exists := m.events[event.ID]; !exists {
-		return fmt.Errorf("event not found")
+func TestSessionNote_Structure(t *testing.T) {
+	now := time.Now()
+	note := SessionNote{
+		FilePath:  "/path/to/file.go",
+		MemoryID:  "memory-456",
+		Status:    "completed",
+		CreatedAt: now,
 	}
-	m.events[event.ID] = event
-	return nil
+	
+	assert.Equal(t, "/path/to/file.go", note.FilePath)
+	assert.Equal(t, "memory-456", note.MemoryID)
+	assert.Equal(t, "completed", note.Status)
+	assert.Equal(t, now, note.CreatedAt)
 }
 
-func (m *mockRepository) Delete(id string) error {
-	m.calls["Delete"]++
-	if _, exists := m.events[id]; !exists {
-		return fmt.Errorf("event not found")
+func TestSessionUpdate_Structure(t *testing.T) {
+	status := StatusInProgress
+	progress := Progress{
+		TotalFiles:     5,
+		ProcessedFiles: 2,
 	}
-	delete(m.events, id)
-	return nil
-}
-
-func (m *mockRepository) ListByWorkspace(workspaceID string) ([]*Event, error) {
-	m.calls["ListByWorkspace"]++
-	var events []*Event
-	for _, event := range m.events {
-		// In a real implementation, we'd filter by workspace
-		events = append(events, event)
+	currentFile := "/current/file.go"
+	note := SessionNote{
+		FilePath: "/note/file.go",
+		MemoryID: "memory-789",
+		Status:   "processing",
 	}
-	return events, nil
-}
-
-func (m *mockRepository) RecordEvent(event *Event) error {
-	m.calls["RecordEvent"]++
-	m.events[event.ID] = event
-	return nil
-}
-
-func (m *mockRepository) GetEvents(sessionID string) ([]*Event, error) {
-	m.calls["GetEvents"]++
-	var events []*Event
-	for _, event := range m.events {
-		if event.SessionID == sessionID {
-			events = append(events, event)
-		}
+	
+	update := SessionUpdate{
+		Status:      &status,
+		Progress:    &progress,
+		CurrentFile: &currentFile,
+		Note:        &note,
 	}
-	return events, nil
+	
+	assert.NotNil(t, update.Status)
+	assert.Equal(t, StatusInProgress, *update.Status)
+	assert.NotNil(t, update.Progress)
+	assert.Equal(t, 5, update.Progress.TotalFiles)
+	assert.NotNil(t, update.CurrentFile)
+	assert.Equal(t, "/current/file.go", *update.CurrentFile)
+	assert.NotNil(t, update.Note)
+	assert.Equal(t, "memory-789", update.Note.MemoryID)
 }
 
-func TestRepositoryInterface(t *testing.T) {
-	repo := newMockRepository()
-
-	t.Run("create and retrieve", func(t *testing.T) {
-		event := &Event{
-			ID:        "test-123",
-			SessionID: "session-456",
-			Type:      "test_event",
-			Timestamp: time.Now(),
-		}
-
-		err := repo.Create(event)
-		assert.NoError(t, err)
-		assert.Equal(t, 1, repo.calls["Create"])
-
-		retrieved, err := repo.GetByID("test-123")
-		assert.NoError(t, err)
-		assert.Equal(t, event.ID, retrieved.ID)
-		assert.Equal(t, 1, repo.calls["GetByID"])
-	})
-
-	t.Run("update", func(t *testing.T) {
-		event := &Event{
-			ID:        "update-123",
-			SessionID: "session-789",
-			Type:      "original",
-			Timestamp: time.Now(),
-		}
-
-		err := repo.Create(event)
-		assert.NoError(t, err)
-
-		event.Type = "updated"
-		err = repo.Update(event)
-		assert.NoError(t, err)
-		assert.Equal(t, 1, repo.calls["Update"])
-
-		retrieved, err := repo.GetByID("update-123")
-		assert.NoError(t, err)
-		assert.Equal(t, "updated", retrieved.Type)
-	})
-
-	t.Run("delete", func(t *testing.T) {
-		event := &Event{
-			ID:        "delete-123",
-			SessionID: "session-999",
-			Type:      "to_delete",
-			Timestamp: time.Now(),
-		}
-
-		err := repo.Create(event)
-		assert.NoError(t, err)
-
-		err = repo.Delete("delete-123")
-		assert.NoError(t, err)
-		assert.Equal(t, 1, repo.calls["Delete"])
-
-		_, err = repo.GetByID("delete-123")
-		assert.Error(t, err)
-	})
-
-	t.Run("list by workspace", func(t *testing.T) {
-		// Create multiple events
-		for i := 0; i < 3; i++ {
-			event := &Event{
-				ID:        fmt.Sprintf("list-%d", i),
-				SessionID: "session-list",
-				Type:      "test",
-				Timestamp: time.Now(),
-			}
-			_ = repo.Create(event)
-		}
-
-		events, err := repo.ListByWorkspace("workspace-123")
-		assert.NoError(t, err)
-		assert.GreaterOrEqual(t, len(events), 3)
-		assert.Equal(t, 1, repo.calls["ListByWorkspace"])
-	})
-
-	t.Run("record and get events", func(t *testing.T) {
-		sessionID := "session-events"
-
-		// Record multiple events for same session
-		for i := 0; i < 3; i++ {
-			event := &Event{
-				ID:        fmt.Sprintf("event-%d", i),
-				SessionID: sessionID,
-				Type:      fmt.Sprintf("type-%d", i),
-				Timestamp: time.Now(),
-			}
-			err := repo.RecordEvent(event)
-			assert.NoError(t, err)
-		}
-
-		// Record event for different session
-		otherEvent := &Event{
-			ID:        "other-event",
-			SessionID: "other-session",
-			Type:      "other",
-			Timestamp: time.Now(),
-		}
-		_ = repo.RecordEvent(otherEvent)
-
-		// Get events for specific session
-		events, err := repo.GetEvents(sessionID)
-		assert.NoError(t, err)
-		assert.Len(t, events, 3)
-		assert.Equal(t, 1, repo.calls["GetEvents"])
-
-		// Verify all events belong to the correct session
-		for _, event := range events {
-			assert.Equal(t, sessionID, event.SessionID)
-		}
-	})
-
-	t.Run("error cases", func(t *testing.T) {
-		// Get non-existent event
-		_, err := repo.GetByID("nonexistent")
-		assert.Error(t, err)
-
-		// Update non-existent event
-		err = repo.Update(&Event{ID: "nonexistent"})
-		assert.Error(t, err)
-
-		// Delete non-existent event
-		err = repo.Delete("nonexistent")
-		assert.Error(t, err)
-	})
+func TestSessionFilter_Structure(t *testing.T) {
+	workspaceID := "workspace-123"
+	status := StatusPending
+	moduleName := "test-module"
+	createdAfter := time.Now().Add(-24 * time.Hour)
+	createdBefore := time.Now()
+	
+	filter := SessionFilter{
+		WorkspaceID:   &workspaceID,
+		Status:        &status,
+		ModuleName:    &moduleName,
+		CreatedAfter:  &createdAfter,
+		CreatedBefore: &createdBefore,
+		Limit:         10,
+		Offset:        20,
+	}
+	
+	assert.NotNil(t, filter.WorkspaceID)
+	assert.Equal(t, "workspace-123", *filter.WorkspaceID)
+	assert.NotNil(t, filter.Status)
+	assert.Equal(t, StatusPending, *filter.Status)
+	assert.NotNil(t, filter.ModuleName)
+	assert.Equal(t, "test-module", *filter.ModuleName)
+	assert.NotNil(t, filter.CreatedAfter)
+	assert.NotNil(t, filter.CreatedBefore)
+	assert.Equal(t, 10, filter.Limit)
+	assert.Equal(t, 20, filter.Offset)
 }
 
-// Ensure interface compliance
-var _ Repository = (*mockRepository)(nil)
+func TestSessionConfig_Structure(t *testing.T) {
+	config := SessionConfig{
+		DefaultTTL:      24 * time.Hour,
+		MaxSessions:     1000,
+		CleanupInterval: 5 * time.Minute,
+	}
+	
+	assert.Equal(t, 24*time.Hour, config.DefaultTTL)
+	assert.Equal(t, 1000, config.MaxSessions)
+	assert.Equal(t, 5*time.Minute, config.CleanupInterval)
+}
+
+func TestEvent_Structure(t *testing.T) {
+	now := time.Now()
+	event := Event{
+		ID:        "event-123",
+		SessionID: "session-456",
+		Type:      "file_processed",
+		Data: map[string]interface{}{
+			"file_path": "/path/to/file.go",
+			"success":   true,
+		},
+		Timestamp: now,
+	}
+	
+	assert.Equal(t, "event-123", event.ID)
+	assert.Equal(t, "session-456", event.SessionID)
+	assert.Equal(t, "file_processed", event.Type)
+	assert.NotNil(t, event.Data)
+	assert.Equal(t, "/path/to/file.go", event.Data["file_path"])
+	assert.Equal(t, true, event.Data["success"])
+	assert.Equal(t, now, event.Timestamp)
+}
+
+func TestStatistics_Structure(t *testing.T) {
+	startTime := time.Now()
+	endTime := startTime.Add(10 * time.Minute)
+	
+	stats := Statistics{
+		StartTime:            startTime,
+		EndTime:              &endTime,
+		Duration:             10 * time.Minute,
+		FilesPerMinute:       2.5,
+		AverageTokensPerFile: 1500.75,
+		TotalTokensUsed:      37500,
+	}
+	
+	assert.Equal(t, startTime, stats.StartTime)
+	assert.NotNil(t, stats.EndTime)
+	assert.Equal(t, endTime, *stats.EndTime)
+	assert.Equal(t, 10*time.Minute, stats.Duration)
+	assert.Equal(t, 2.5, stats.FilesPerMinute)
+	assert.Equal(t, 1500.75, stats.AverageTokensPerFile)
+	assert.Equal(t, 37500, stats.TotalTokensUsed)
+}

@@ -1,641 +1,561 @@
 package session
 
 import (
-	"context"
-	"fmt"
+	"database/sql"
+	"encoding/json"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-// Mock session for testing
-type mockSession struct {
-	ID        string
-	Data      string
-	ExpiresAt time.Time
-}
-
-func (m *mockSession) GetID() string {
-	return m.ID
-}
-
 func TestNewManager(t *testing.T) {
+	db, _, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
 	tests := []struct {
-		name    string
-		config  SessionConfig
-		wantErr bool
-		errMsg  string
+		name     string
+		config   SessionConfig
+		expected SessionConfig
 	}{
 		{
-			name: "valid config",
+			name:   "default config",
+			config: SessionConfig{},
+			expected: SessionConfig{
+				DefaultTTL:      24 * time.Hour,
+				CleanupInterval: 5 * time.Minute,
+				MaxSessions:     1000,
+			},
+		},
+		{
+			name: "custom config",
 			config: SessionConfig{
-				Timeout:         24 * time.Hour,
-				MaxConcurrent:   100,
-				CleanupInterval: 1 * time.Hour,
+				DefaultTTL:      12 * time.Hour,
+				CleanupInterval: 10 * time.Minute,
+				MaxSessions:     500,
 			},
-			wantErr: false,
-		},
-		{
-			name: "zero max concurrent",
-			config: SessionConfig{
-				Timeout:         24 * time.Hour,
-				MaxConcurrent:   0,
-				CleanupInterval: 1 * time.Hour,
-			},
-			wantErr: true,
-			errMsg:  "max_concurrent must be positive",
-		},
-		{
-			name: "negative max concurrent",
-			config: SessionConfig{
-				Timeout:         24 * time.Hour,
-				MaxConcurrent:   -1,
-				CleanupInterval: 1 * time.Hour,
-			},
-			wantErr: true,
-			errMsg:  "max_concurrent must be positive",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			manager, err := NewManager(tt.config)
-
-			if tt.wantErr {
-				assert.Error(t, err)
-				assert.Contains(t, err.Error(), tt.errMsg)
-				assert.Nil(t, manager)
-			} else {
-				assert.NoError(t, err)
-				assert.NotNil(t, manager)
-
-				// Verify it's the right type
-				impl, ok := manager.(*ManagerImpl)
-				assert.True(t, ok)
-				assert.NotNil(t, impl.sessions)
-				assert.Equal(t, tt.config, impl.config)
-			}
-		})
-	}
-}
-
-func TestManagerCreate(t *testing.T) {
-	tests := []struct {
-		name       string
-		session    Session
-		setupFunc  func(*ManagerImpl)
-		wantErr    bool
-		errMsg     string
-		verifyFunc func(*testing.T, *ManagerImpl)
-	}{
-		{
-			name: "successful creation",
-			session: &mockSession{
-				ID:   "session-123",
-				Data: "test data",
-			},
-			wantErr: false,
-			verifyFunc: func(t *testing.T, m *ManagerImpl) {
-				assert.Len(t, m.sessions, 1)
-				stored, exists := m.sessions["session-123"]
-				assert.True(t, exists)
-				sess := stored.(*mockSession)
-				assert.Equal(t, "session-123", sess.ID)
-				assert.Equal(t, "test data", sess.Data)
-			},
-		},
-		{
-			name: "max concurrent sessions reached",
-			session: &mockSession{
-				ID:   "session-new",
-				Data: "new session",
-			},
-			setupFunc: func(m *ManagerImpl) {
-				// Fill up to max capacity
-				for i := 0; i < m.config.MaxConcurrent; i++ {
-					m.sessions[fmt.Sprintf("session-%d", i)] = &mockSession{
-						ID: fmt.Sprintf("session-%d", i),
-					}
-				}
-			},
-			wantErr: true,
-			errMsg:  "maximum concurrent sessions (10) reached",
-			verifyFunc: func(t *testing.T, m *ManagerImpl) {
-				// Verify the new session wasn't added
-				_, exists := m.sessions["session-new"]
-				assert.False(t, exists)
-			},
-		},
-		{
-			name: "duplicate session ID",
-			session: &mockSession{
-				ID:   "session-duplicate",
-				Data: "new data",
-			},
-			setupFunc: func(m *ManagerImpl) {
-				m.sessions["session-duplicate"] = &mockSession{
-					ID:   "session-duplicate",
-					Data: "old data",
-				}
-			},
-			wantErr: false, // Should overwrite
-			verifyFunc: func(t *testing.T, m *ManagerImpl) {
-				stored := m.sessions["session-duplicate"].(*mockSession)
-				assert.Equal(t, "new data", stored.Data)
+			expected: SessionConfig{
+				DefaultTTL:      12 * time.Hour,
+				CleanupInterval: 10 * time.Minute,
+				MaxSessions:     500,
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := &ManagerImpl{
-				sessions: make(map[string]Session),
-				config: SessionConfig{
-					MaxConcurrent:   10,
-					CleanupInterval: 1 * time.Hour,
-				},
-			}
-
-			if tt.setupFunc != nil {
-				tt.setupFunc(manager)
-			}
-
-			err := manager.Create(context.Background(), tt.session)
-
-			if tt.wantErr {
-				assert.Error(t, err)
-				assert.Contains(t, err.Error(), tt.errMsg)
-			} else {
-				assert.NoError(t, err)
-			}
-
-			if tt.verifyFunc != nil {
-				tt.verifyFunc(t, manager)
-			}
-		})
-	}
-}
-
-func TestManagerGet(t *testing.T) {
-	tests := []struct {
-		name       string
-		sessionID  string
-		setupFunc  func(*ManagerImpl)
-		wantErr    bool
-		errMsg     string
-		verifyFunc func(*testing.T, Session)
-	}{
-		{
-			name:      "successful retrieval",
-			sessionID: "session-123",
-			setupFunc: func(m *ManagerImpl) {
-				m.sessions["session-123"] = &mockSession{
-					ID:   "session-123",
-					Data: "test data",
-				}
-			},
-			wantErr: false,
-			verifyFunc: func(t *testing.T, result Session) {
-				assert.NotNil(t, result)
-				sess := result.(*mockSession)
-				assert.Equal(t, "session-123", sess.ID)
-				assert.Equal(t, "test data", sess.Data)
-			},
-		},
-		{
-			name:      "session not found",
-			sessionID: "nonexistent",
-			wantErr:   true,
-			errMsg:    "session nonexistent not found",
-		},
-		{
-			name:      "empty session ID",
-			sessionID: "",
-			wantErr:   true,
-			errMsg:    "session  not found",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			manager := &ManagerImpl{
-				sessions: make(map[string]Session),
-				config: SessionConfig{
-					MaxConcurrent: 10,
-				},
-			}
-
-			if tt.setupFunc != nil {
-				tt.setupFunc(manager)
-			}
-
-			result, err := manager.Get(context.Background(), tt.sessionID)
-
-			if tt.wantErr {
-				assert.Error(t, err)
-				assert.Contains(t, err.Error(), tt.errMsg)
-				assert.Nil(t, result)
-			} else {
-				assert.NoError(t, err)
-				if tt.verifyFunc != nil {
-					tt.verifyFunc(t, result)
-				}
-			}
-		})
-	}
-}
-
-func TestManagerUpdate(t *testing.T) {
-	tests := []struct {
-		name       string
-		session    Session
-		setupFunc  func(*ManagerImpl)
-		wantErr    bool
-		errMsg     string
-		verifyFunc func(*testing.T, *ManagerImpl)
-	}{
-		{
-			name: "successful update",
-			session: &mockSession{
-				ID:   "session-123",
-				Data: "updated data",
-			},
-			setupFunc: func(m *ManagerImpl) {
-				m.sessions["session-123"] = &mockSession{
-					ID:   "session-123",
-					Data: "old data",
-				}
-			},
-			wantErr: false,
-			verifyFunc: func(t *testing.T, m *ManagerImpl) {
-				stored := m.sessions["session-123"].(*mockSession)
-				assert.Equal(t, "updated data", stored.Data)
-			},
-		},
-		{
-			name: "session not found",
-			session: &mockSession{
-				ID:   "nonexistent",
-				Data: "data",
-			},
-			wantErr: true,
-			errMsg:  "session nonexistent not found",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			manager := &ManagerImpl{
-				sessions: make(map[string]Session),
-				config: SessionConfig{
-					MaxConcurrent: 10,
-				},
-			}
-
-			if tt.setupFunc != nil {
-				tt.setupFunc(manager)
-			}
-
-			err := manager.Update(context.Background(), tt.session)
-
-			if tt.wantErr {
-				assert.Error(t, err)
-				assert.Contains(t, err.Error(), tt.errMsg)
-			} else {
-				assert.NoError(t, err)
-			}
-
-			if tt.verifyFunc != nil {
-				tt.verifyFunc(t, manager)
-			}
-		})
-	}
-}
-
-func TestManagerDelete(t *testing.T) {
-	tests := []struct {
-		name       string
-		sessionID  string
-		setupFunc  func(*ManagerImpl)
-		wantErr    bool
-		errMsg     string
-		verifyFunc func(*testing.T, *ManagerImpl)
-	}{
-		{
-			name:      "successful deletion",
-			sessionID: "session-123",
-			setupFunc: func(m *ManagerImpl) {
-				m.sessions["session-123"] = &mockSession{
-					ID: "session-123",
-				}
-			},
-			wantErr: false,
-			verifyFunc: func(t *testing.T, m *ManagerImpl) {
-				_, exists := m.sessions["session-123"]
-				assert.False(t, exists)
-				assert.Len(t, m.sessions, 0)
-			},
-		},
-		{
-			name:      "session not found",
-			sessionID: "nonexistent",
-			wantErr:   true,
-			errMsg:    "session nonexistent not found",
-		},
-		{
-			name:      "delete from multiple sessions",
-			sessionID: "session-2",
-			setupFunc: func(m *ManagerImpl) {
-				m.sessions["session-1"] = &mockSession{ID: "session-1"}
-				m.sessions["session-2"] = &mockSession{ID: "session-2"}
-				m.sessions["session-3"] = &mockSession{ID: "session-3"}
-			},
-			wantErr: false,
-			verifyFunc: func(t *testing.T, m *ManagerImpl) {
-				_, exists := m.sessions["session-2"]
-				assert.False(t, exists)
-				assert.Len(t, m.sessions, 2)
-				assert.NotNil(t, m.sessions["session-1"])
-				assert.NotNil(t, m.sessions["session-3"])
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			manager := &ManagerImpl{
-				sessions: make(map[string]Session),
-				config: SessionConfig{
-					MaxConcurrent: 10,
-				},
-			}
-
-			if tt.setupFunc != nil {
-				tt.setupFunc(manager)
-			}
-
-			err := manager.Delete(context.Background(), tt.sessionID)
-
-			if tt.wantErr {
-				assert.Error(t, err)
-				assert.Contains(t, err.Error(), tt.errMsg)
-			} else {
-				assert.NoError(t, err)
-			}
-
-			if tt.verifyFunc != nil {
-				tt.verifyFunc(t, manager)
-			}
-		})
-	}
-}
-
-func TestManagerList(t *testing.T) {
-	tests := []struct {
-		name       string
-		setupFunc  func(*ManagerImpl)
-		verifyFunc func(*testing.T, []Session)
-	}{
-		{
-			name: "empty session list",
-			verifyFunc: func(t *testing.T, sessions []Session) {
-				assert.Len(t, sessions, 0)
-			},
-		},
-		{
-			name: "single session",
-			setupFunc: func(m *ManagerImpl) {
-				m.sessions["session-1"] = &mockSession{
-					ID:   "session-1",
-					Data: "data",
-				}
-			},
-			verifyFunc: func(t *testing.T, sessions []Session) {
-				assert.Len(t, sessions, 1)
-				sess := sessions[0].(*mockSession)
-				assert.Equal(t, "session-1", sess.ID)
-			},
-		},
-		{
-			name: "multiple sessions",
-			setupFunc: func(m *ManagerImpl) {
-				for i := 1; i <= 3; i++ {
-					m.sessions[fmt.Sprintf("session-%d", i)] = &mockSession{
-						ID:   fmt.Sprintf("session-%d", i),
-						Data: fmt.Sprintf("data-%d", i),
-					}
-				}
-			},
-			verifyFunc: func(t *testing.T, sessions []Session) {
-				assert.Len(t, sessions, 3)
-
-				// Create a map to verify all sessions are returned
-				sessionMap := make(map[string]bool)
-				for _, s := range sessions {
-					sess := s.(*mockSession)
-					sessionMap[sess.ID] = true
-				}
-
-				assert.True(t, sessionMap["session-1"])
-				assert.True(t, sessionMap["session-2"])
-				assert.True(t, sessionMap["session-3"])
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			manager := &ManagerImpl{
-				sessions: make(map[string]Session),
-				config: SessionConfig{
-					MaxConcurrent: 10,
-				},
-			}
-
-			if tt.setupFunc != nil {
-				tt.setupFunc(manager)
-			}
-
-			sessions, err := manager.List(context.Background())
+			manager := NewManager(db, tt.config)
+			assert.NotNil(t, manager)
+			assert.Equal(t, tt.expected, manager.config)
+			assert.NotNil(t, manager.cache)
+			assert.NotNil(t, manager.expiryTicker)
+			
+			// Cleanup
+			err := manager.Shutdown()
 			assert.NoError(t, err)
-
-			if tt.verifyFunc != nil {
-				tt.verifyFunc(t, sessions)
-			}
 		})
 	}
 }
 
-func TestManagerCleanupExpired(t *testing.T) {
-	// Current implementation doesn't actually clean up expired sessions
-	// This is a placeholder test for the method
-	manager := &ManagerImpl{
-		sessions: make(map[string]Session),
-		config: SessionConfig{
-			MaxConcurrent: 10,
-		},
-	}
+func TestManager_Create(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
 
-	// Add some sessions
-	manager.sessions["session-1"] = &mockSession{ID: "session-1"}
-	manager.sessions["session-2"] = &mockSession{ID: "session-2"}
+	manager := NewManager(db, SessionConfig{
+		DefaultTTL: 24 * time.Hour,
+	})
+	defer manager.Shutdown()
 
-	err := manager.CleanupExpired(context.Background())
+	workspaceID := "workspace-123"
+	moduleName := "test-module"
+	filePaths := []string{"/path/to/file1.go", "/path/to/file2.go"}
+
+	// Expect insert query
+	mock.ExpectExec("INSERT INTO documentation_sessions").
+		WithArgs(
+			sqlmock.AnyArg(), // ID
+			workspaceID,
+			moduleName,
+			StatusPending,
+			pq.Array(filePaths),
+			1, // version
+			sqlmock.AnyArg(), // created_at
+			sqlmock.AnyArg(), // updated_at
+			sqlmock.AnyArg(), // expires_at
+			sqlmock.AnyArg(), // progress JSON
+		).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	session, err := manager.Create(workspaceID, moduleName, filePaths)
+	require.NoError(t, err)
+	assert.NotNil(t, session)
+	assert.Equal(t, workspaceID, session.WorkspaceID)
+	assert.Equal(t, moduleName, session.ModuleName)
+	assert.Equal(t, StatusPending, session.Status)
+	assert.Equal(t, filePaths, session.FilePaths)
+	assert.Equal(t, len(filePaths), session.Progress.TotalFiles)
+	assert.Equal(t, 0, session.Progress.ProcessedFiles)
+	assert.Equal(t, 1, session.Version)
+
+	// Verify cache
+	cached := manager.cache.get(session.ID)
+	assert.NotNil(t, cached)
+	assert.Equal(t, session.ID, cached.ID)
+
+	// Verify all expectations
+	err = mock.ExpectationsWereMet()
 	assert.NoError(t, err)
-
-	// In the current implementation, sessions should remain
-	assert.Len(t, manager.sessions, 2)
 }
 
-func TestManagerConcurrency(t *testing.T) {
-	manager := &ManagerImpl{
-		sessions: make(map[string]Session),
-		config: SessionConfig{
-			MaxConcurrent:   100,
-			CleanupInterval: 1 * time.Hour,
-		},
+func TestManager_Get(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	manager := NewManager(db, SessionConfig{})
+	defer manager.Shutdown()
+
+	sessionID := uuid.New()
+	workspaceID := "workspace-123"
+	moduleName := "test-module"
+	filePaths := []string{"/path/to/file1.go"}
+	progress := Progress{
+		TotalFiles:     1,
+		ProcessedFiles: 0,
+		CurrentFile:    "",
+		FailedFiles:    []string{},
 	}
+	progressJSON, _ := json.Marshal(progress)
 
-	// Test concurrent creates
-	t.Run("concurrent creates", func(t *testing.T) {
-		var wg sync.WaitGroup
-		numGoroutines := 50
-
-		for i := 0; i < numGoroutines; i++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-				session := &mockSession{
-					ID:   fmt.Sprintf("concurrent-%d", id),
-					Data: fmt.Sprintf("data-%d", id),
-				}
-				err := manager.Create(context.Background(), session)
-				assert.NoError(t, err)
-			}(i)
+	t.Run("from cache", func(t *testing.T) {
+		// Add to cache
+		session := &Session{
+			ID:          sessionID,
+			WorkspaceID: workspaceID,
+			ModuleName:  moduleName,
+			Status:      StatusPending,
+			FilePaths:   filePaths,
+			Progress:    progress,
+			Version:     1,
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+			ExpiresAt:   time.Now().Add(24 * time.Hour),
 		}
+		manager.cache.set(session)
 
-		wg.Wait()
-		assert.Len(t, manager.sessions, numGoroutines)
+		// Get from cache
+		result, err := manager.Get(sessionID)
+		require.NoError(t, err)
+		assert.Equal(t, session.ID, result.ID)
 	})
 
-	// Test concurrent reads
-	t.Run("concurrent reads", func(t *testing.T) {
-		var wg sync.WaitGroup
-		numReaders := 100
+	t.Run("from database", func(t *testing.T) {
+		// Clear cache
+		manager.cache.delete(sessionID)
 
-		for i := 0; i < numReaders; i++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-				sessionID := fmt.Sprintf("concurrent-%d", id%50)
-				session, err := manager.Get(context.Background(), sessionID)
-				assert.NoError(t, err)
-				assert.NotNil(t, session)
-			}(i)
-		}
+		// Setup mock query
+		rows := sqlmock.NewRows([]string{
+			"id", "workspace_id", "module_name", "status", "file_paths",
+			"version", "created_at", "updated_at", "expires_at", "progress",
+		}).AddRow(
+			sessionID, workspaceID, moduleName, StatusPending, pq.Array(filePaths),
+			1, time.Now(), time.Now(), time.Now().Add(24*time.Hour), progressJSON,
+		)
 
-		wg.Wait()
+		mock.ExpectQuery("SELECT .+ FROM documentation_sessions WHERE id =").
+			WithArgs(sessionID).
+			WillReturnRows(rows)
+
+		result, err := manager.Get(sessionID)
+		require.NoError(t, err)
+		assert.Equal(t, sessionID, result.ID)
+		assert.Equal(t, workspaceID, result.WorkspaceID)
+
+		// Verify cached
+		cached := manager.cache.get(sessionID)
+		assert.NotNil(t, cached)
 	})
 
-	// Test concurrent updates
-	t.Run("concurrent updates", func(t *testing.T) {
-		var wg sync.WaitGroup
-		numUpdaters := 50
+	t.Run("not found", func(t *testing.T) {
+		notFoundID := uuid.New()
+		manager.cache.delete(notFoundID)
 
-		for i := 0; i < numUpdaters; i++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-				session := &mockSession{
-					ID:   fmt.Sprintf("concurrent-%d", id),
-					Data: fmt.Sprintf("updated-data-%d", id),
-				}
-				err := manager.Update(context.Background(), session)
-				assert.NoError(t, err)
-			}(i)
-		}
+		mock.ExpectQuery("SELECT .+ FROM documentation_sessions WHERE id =").
+			WithArgs(notFoundID).
+			WillReturnError(sql.ErrNoRows)
 
-		wg.Wait()
-	})
-
-	// Test mixed operations
-	t.Run("mixed operations", func(t *testing.T) {
-		var wg sync.WaitGroup
-
-		// Creators
-		for i := 0; i < 10; i++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-				session := &mockSession{
-					ID:   fmt.Sprintf("mixed-%d", id),
-					Data: fmt.Sprintf("data-%d", id),
-				}
-				_ = manager.Create(context.Background(), session)
-			}(i)
-		}
-
-		// Readers
-		for i := 0; i < 20; i++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-				sessionID := fmt.Sprintf("concurrent-%d", id%50)
-				_, _ = manager.Get(context.Background(), sessionID)
-			}(i)
-		}
-
-		// Updaters
-		for i := 0; i < 10; i++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-				session := &mockSession{
-					ID:   fmt.Sprintf("concurrent-%d", id),
-					Data: fmt.Sprintf("mixed-update-%d", id),
-				}
-				_ = manager.Update(context.Background(), session)
-			}(i)
-		}
-
-		// Deleters
-		for i := 0; i < 5; i++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-				sessionID := fmt.Sprintf("concurrent-%d", id+45)
-				_ = manager.Delete(context.Background(), sessionID)
-			}(i)
-		}
-
-		wg.Wait()
+		_, err := manager.Get(notFoundID)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "not found")
 	})
 }
 
-func TestCleanupRoutine(t *testing.T) {
-	// Test that cleanup routine starts and runs
-	config := SessionConfig{
-		MaxConcurrent:   10,
-		CleanupInterval: 100 * time.Millisecond, // Short interval for testing
+func TestManager_Update(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	manager := NewManager(db, SessionConfig{})
+	defer manager.Shutdown()
+
+	sessionID := uuid.New()
+	session := &Session{
+		ID:          sessionID,
+		WorkspaceID: "workspace-123",
+		ModuleName:  "test-module",
+		Status:      StatusPending,
+		FilePaths:   []string{"/path/to/file1.go"},
+		Progress: Progress{
+			TotalFiles:     1,
+			ProcessedFiles: 0,
+		},
+		Notes:   []SessionNote{},
+		Version: 1,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(24 * time.Hour),
 	}
 
-	manager, err := NewManager(config)
-	assert.NoError(t, err)
+	// Add to cache
+	manager.cache.set(session)
 
-	// Add a session
-	session := &mockSession{ID: "test-cleanup"}
-	err = manager.Create(context.Background(), session)
-	assert.NoError(t, err)
+	newStatus := StatusInProgress
+	newProgress := Progress{
+		TotalFiles:     1,
+		ProcessedFiles: 1,
+		CurrentFile:    "/path/to/file1.go",
+	}
+	progressJSON, _ := json.Marshal(newProgress)
 
-	// Wait for at least one cleanup cycle
+	// Expect update query with optimistic locking
+	mock.ExpectExec("UPDATE documentation_sessions").
+		WithArgs(
+			newStatus,
+			sqlmock.AnyArg(), // updated_at
+			2,                // new version
+			progressJSON,
+			sessionID,
+			1, // previous version
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	err = manager.Update(sessionID, SessionUpdate{
+		Status:   &newStatus,
+		Progress: &newProgress,
+	})
+	require.NoError(t, err)
+
+	// Verify cache updated
+	cached := manager.cache.get(sessionID)
+	assert.Equal(t, newStatus, cached.Status)
+	assert.Equal(t, 2, cached.Version)
+	assert.Equal(t, newProgress, cached.Progress)
+}
+
+func TestManager_Delete(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	manager := NewManager(db, SessionConfig{})
+	defer manager.Shutdown()
+
+	sessionID := uuid.New()
+	session := &Session{ID: sessionID}
+	manager.cache.set(session)
+
+	// Expect delete query
+	mock.ExpectExec("DELETE FROM documentation_sessions").
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	err = manager.Delete(sessionID)
+	require.NoError(t, err)
+
+	// Verify removed from cache
+	cached := manager.cache.get(sessionID)
+	assert.Nil(t, cached)
+}
+
+func TestManager_List(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	manager := NewManager(db, SessionConfig{})
+	defer manager.Shutdown()
+
+	workspaceID := "workspace-123"
+	status := StatusPending
+	moduleName := "test-module"
+	createdAfter := time.Now().Add(-24 * time.Hour)
+
+	filter := SessionFilter{
+		WorkspaceID:  &workspaceID,
+		Status:       &status,
+		ModuleName:   &moduleName,
+		CreatedAfter: &createdAfter,
+		Limit:        10,
+		Offset:       0,
+	}
+
+	// Setup mock rows
+	sessionID := uuid.New()
+	progress := Progress{TotalFiles: 1}
+	progressJSON, _ := json.Marshal(progress)
+
+	rows := sqlmock.NewRows([]string{
+		"id", "workspace_id", "module_name", "status", "file_paths",
+		"version", "created_at", "updated_at", "expires_at", "progress",
+	}).AddRow(
+		sessionID, workspaceID, moduleName, status, pq.Array([]string{"/file1.go"}),
+		1, time.Now(), time.Now(), time.Now().Add(24*time.Hour), progressJSON,
+	)
+
+	// Expect query with filters
+	mock.ExpectQuery("SELECT .+ FROM documentation_sessions WHERE").
+		WithArgs(workspaceID, status, moduleName, createdAfter).
+		WillReturnRows(rows)
+
+	sessions, err := manager.List(filter)
+	require.NoError(t, err)
+	assert.Len(t, sessions, 1)
+	assert.Equal(t, sessionID, sessions[0].ID)
+}
+
+func TestManager_ExpireSessions(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	manager := NewManager(db, SessionConfig{})
+	defer manager.Shutdown()
+
+	// Expect update query for expiration
+	mock.ExpectExec("UPDATE documentation_sessions").
+		WithArgs(
+			StatusExpired,
+			sqlmock.AnyArg(), // updated_at
+			sqlmock.AnyArg(), // time.Now() for comparison
+			StatusPending,
+			StatusInProgress,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 3))
+
+	err = manager.ExpireSessions()
+	require.NoError(t, err)
+}
+
+func TestManager_ConcurrentAccess(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	manager := NewManager(db, SessionConfig{})
+	defer manager.Shutdown()
+
+	sessionID := uuid.New()
+	session := &Session{
+		ID:          sessionID,
+		WorkspaceID: "workspace-123",
+		Status:      StatusPending,
+		Version:     1,
+	}
+
+	// Setup expectations for concurrent operations
+	for i := 0; i < 10; i++ {
+		mock.ExpectExec("UPDATE documentation_sessions").
+			WithArgs(
+				sqlmock.AnyArg(), // status
+				sqlmock.AnyArg(), // updated_at
+				sqlmock.AnyArg(), // version
+				sqlmock.AnyArg(), // progress
+				sessionID,
+				sqlmock.AnyArg(), // previous version
+			).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+
+	// Add to cache
+	manager.cache.set(session)
+
+	// Concurrent updates
+	var wg sync.WaitGroup
+	errors := make([]error, 10)
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			
+			status := StatusInProgress
+			errors[idx] = manager.Update(sessionID, SessionUpdate{
+				Status: &status,
+			})
+		}(i)
+	}
+
+	wg.Wait()
+
+	// At least some should succeed
+	successCount := 0
+	for _, err := range errors {
+		if err == nil {
+			successCount++
+		}
+	}
+	assert.Greater(t, successCount, 0)
+}
+
+func TestManager_OptimisticLocking(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	manager := NewManager(db, SessionConfig{})
+	defer manager.Shutdown()
+
+	sessionID := uuid.New()
+	session := &Session{
+		ID:      sessionID,
+		Version: 1,
+		Status:  StatusPending,
+	}
+	manager.cache.set(session)
+
+	// Simulate concurrent modification - no rows affected
+	mock.ExpectExec("UPDATE documentation_sessions").
+		WithArgs(
+			sqlmock.AnyArg(), // status
+			sqlmock.AnyArg(), // updated_at
+			2,                // new version
+			sqlmock.AnyArg(), // progress
+			sessionID,
+			1, // previous version
+		).
+		WillReturnResult(sqlmock.NewResult(0, 0)) // No rows affected
+
+	status := StatusInProgress
+	err = manager.Update(sessionID, SessionUpdate{
+		Status: &status,
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "concurrent modification")
+}
+
+func TestSessionCache(t *testing.T) {
+	cache := &sessionCache{
+		sessions: make(map[uuid.UUID]*Session),
+	}
+
+	sessionID := uuid.New()
+	session := &Session{
+		ID:     sessionID,
+		Status: StatusPending,
+	}
+
+	// Test set
+	cache.set(session)
+	
+	// Test get
+	retrieved := cache.get(sessionID)
+	assert.NotNil(t, retrieved)
+	assert.Equal(t, sessionID, retrieved.ID)
+
+	// Test delete
+	cache.delete(sessionID)
+	retrieved = cache.get(sessionID)
+	assert.Nil(t, retrieved)
+
+	// Test concurrent access
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(3)
+		
+		// Concurrent set
+		go func() {
+			defer wg.Done()
+			cache.set(&Session{ID: uuid.New()})
+		}()
+		
+		// Concurrent get
+		go func() {
+			defer wg.Done()
+			cache.get(uuid.New())
+		}()
+		
+		// Concurrent delete
+		go func() {
+			defer wg.Done()
+			cache.delete(uuid.New())
+		}()
+	}
+	wg.Wait()
+}
+
+func TestManager_ExpiryHandler(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Create manager with short cleanup interval
+	manager := NewManager(db, SessionConfig{
+		CleanupInterval: 100 * time.Millisecond,
+	})
+
+	// Expect at least one expiry call
+	mock.ExpectExec("UPDATE documentation_sessions").
+		WithArgs(
+			StatusExpired,
+			sqlmock.AnyArg(),
+			sqlmock.AnyArg(),
+			StatusPending,
+			StatusInProgress,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	// Wait for expiry handler to run
 	time.Sleep(150 * time.Millisecond)
 
-	// Session should still exist (current implementation doesn't remove)
-	_, err = manager.Get(context.Background(), "test-cleanup")
+	// Shutdown and verify
+	err = manager.Shutdown()
 	assert.NoError(t, err)
 }
 
-// Helper to ensure interface compliance
-var _ Manager = (*ManagerImpl)(nil)
+// BenchmarkSessionCache tests cache performance
+func BenchmarkSessionCache(b *testing.B) {
+	cache := &sessionCache{
+		sessions: make(map[uuid.UUID]*Session),
+	}
+
+	// Pre-populate cache
+	for i := 0; i < 1000; i++ {
+		session := &Session{ID: uuid.New()}
+		cache.set(session)
+	}
+
+	sessionID := uuid.New()
+	cache.set(&Session{ID: sessionID})
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			// Mix of operations
+			switch b.N % 3 {
+			case 0:
+				cache.get(sessionID)
+			case 1:
+				cache.set(&Session{ID: uuid.New()})
+			case 2:
+				cache.delete(uuid.New())
+			}
+		}
+	})
+}
