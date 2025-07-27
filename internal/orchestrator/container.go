@@ -49,7 +49,7 @@ func (c *DefaultContainer) Register(name string, service interface{}) {
 func (c *DefaultContainer) Get(name string) (interface{}, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	service, exists := c.services[name]
 	if !exists {
 		return nil, fmt.Errorf("service %s not registered", name)
@@ -87,7 +87,7 @@ func (c *DefaultContainer) Has(name string) bool {
 func (c *DefaultContainer) Services() []string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	names := make([]string, 0, len(c.services))
 	for name := range c.services {
 		names = append(names, name)
