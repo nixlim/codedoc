@@ -16,6 +16,15 @@ Establish the core orchestration infrastructure with session management, workflo
 
 ### High Priority Tasks
 
+#### T00: Foundation Setup
+- Initialize Go module and project structure
+- Install core dependencies
+- Set up development environment
+- Configure Docker services
+- **Estimate**: 2 hours
+- **Acceptance**: Go project builds and services running
+- **Task File**: [T00_S01_foundation_setup.md](./T00_S01_foundation_setup.md)
+
 #### T01: Orchestrator Service Structure
 - Create `/internal/orchestrator/` package structure
 - Define core interfaces and types
@@ -116,10 +125,11 @@ Establish the core orchestration infrastructure with session management, workflo
 - [ ] Performance benchmarks established
 
 ## Dependencies
-- Foundation milestone must be complete
-- PostgreSQL database running
-- Project structure established
-- Logging infrastructure ready
+- T00 Foundation Setup must be complete (addresses all below):
+  - Go project structure established
+  - PostgreSQL database running
+  - Logging infrastructure ready
+  - Core dependencies installed
 
 ## Risks
 - **State machine complexity**: May require iteration on design
@@ -155,7 +165,8 @@ This sprint focuses on building a solid foundation. We're not implementing the f
 ## Total Effort
 Original: 64 hours
 Additional: 14 hours
-**Total Sprint Effort: 78 hours**
+Foundation Setup: 2 hours
+**Total Sprint Effort: 80 hours**
 
 ## Sprint Review Agenda
 1. Demo session creation and lifecycle
