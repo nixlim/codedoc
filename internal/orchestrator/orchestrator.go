@@ -2,10 +2,12 @@ package orchestrator
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
 
+	_ "github.com/lib/pq" // PostgreSQL driver
 	"github.com/google/uuid"
 	"github.com/nixlim/codedoc-mcp-server/internal/orchestrator/services"
 	"github.com/nixlim/codedoc-mcp-server/internal/orchestrator/session"
@@ -19,6 +21,7 @@ import (
 // workflow states, and TODO lists while integrating with various services.
 type OrchestratorImpl struct {
 	container       Container
+	db              *sql.DB
 	sessionManager  session.Manager
 	workflowEngine  workflow.Engine
 	todoManager     todolist.Manager
@@ -34,18 +37,22 @@ func NewOrchestrator(config *Config) (*OrchestratorImpl, error) {
 		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
 
+	// Initialize database connection
+	db, err := InitDatabase(&config.Database)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize database: %w", err)
+	}
+
 	// Create dependency container
 	container := NewContainer()
+	container.Register("db", db)
 
 	// Initialize core components
-	sessionManager, err := session.NewManager(session.SessionConfig{
-		Timeout:         config.Session.Timeout,
-		MaxConcurrent:   config.Session.MaxConcurrent,
+	sessionManager := session.NewManager(db, session.SessionConfig{
+		DefaultTTL:      config.Session.Timeout,
+		MaxSessions:     config.Session.MaxConcurrent,
 		CleanupInterval: config.Session.CleanupInterval,
 	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create session manager: %w", err)
-	}
 
 	workflowEngine, err := workflow.NewEngine(workflow.WorkflowConfig{
 		MaxRetries:        config.Workflow.MaxRetries,
@@ -72,6 +79,7 @@ func NewOrchestrator(config *Config) (*OrchestratorImpl, error) {
 
 	return &OrchestratorImpl{
 		container:       container,
+		db:              db,
 		sessionManager:  sessionManager,
 		workflowEngine:  workflowEngine,
 		todoManager:     todoManager,
@@ -94,60 +102,58 @@ func (o *OrchestratorImpl) StartDocumentation(ctx context.Context, req Documenta
 		maxDepth = 10 // Default max depth
 	}
 
-	// Create new session
-	sessionID := uuid.New().String()
-	now := time.Now()
-
-	sess := &DocumentationSession{
-		ID:          sessionID,
-		WorkspaceID: req.WorkspaceID,
-		ProjectPath: req.ProjectPath,
-		State:       WorkflowStateIdle,
-		Progress: SessionProgress{
-			TotalFiles:     0,
-			ProcessedFiles: 0,
-			FailedFiles:    0,
-		},
-		CreatedAt: now,
-		UpdatedAt: now,
-		ExpiresAt: now.Add(o.config.Session.Timeout),
-	}
-
-	// Save session
-	if err := o.sessionManager.Create(ctx, sess); err != nil {
+	// Create new session using the session manager
+	sess, err := o.sessionManager.Create(req.WorkspaceID, req.ProjectPath, []string{})
+	if err != nil {
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
 
+	// Convert to DocumentationSession
+	docSess := &DocumentationSession{
+		ID:          sess.GetID(),
+		WorkspaceID: sess.WorkspaceID,
+		ProjectPath: sess.ModuleName, // Using ModuleName as ProjectPath
+		State:       WorkflowStateIdle,
+		Progress: SessionProgress{
+			TotalFiles:     sess.Progress.TotalFiles,
+			ProcessedFiles: sess.Progress.ProcessedFiles,
+			FailedFiles:    len(sess.Progress.FailedFiles),
+		},
+		CreatedAt: sess.CreatedAt,
+		UpdatedAt: sess.UpdatedAt,
+		ExpiresAt: sess.ExpiresAt,
+	}
+
 	// Initialize workflow
-	if err := o.workflowEngine.Initialize(ctx, sessionID, workflow.WorkflowStateIdle); err != nil {
+	if err := o.workflowEngine.Initialize(ctx, docSess.ID, workflow.WorkflowStateIdle); err != nil {
 		return nil, fmt.Errorf("failed to initialize workflow: %w", err)
 	}
 
 	// Create TODO list for the session
-	if err := o.todoManager.CreateList(ctx, sessionID); err != nil {
+	if err := o.todoManager.CreateList(ctx, docSess.ID); err != nil {
 		return nil, fmt.Errorf("failed to create TODO list: %w", err)
 	}
 
 	log.Info().
-		Str("session_id", sessionID).
+		Str("session_id", docSess.ID).
 		Str("workspace_id", req.WorkspaceID).
 		Str("project_path", req.ProjectPath).
 		Msg("Documentation session started")
 
-	return sess, nil
+	return docSess, nil
 }
 
 // GetSession retrieves an existing documentation session by ID.
 func (o *OrchestratorImpl) GetSession(ctx context.Context, sessionID string) (*DocumentationSession, error) {
-	sessInterface, err := o.sessionManager.Get(ctx, sessionID)
+	// Parse UUID
+	id, err := uuid.Parse(sessionID)
 	if err != nil {
-		return nil, fmt.Errorf("session not found: %w", err)
+		return nil, fmt.Errorf("invalid session ID: %w", err)
 	}
 
-	// Type assert to DocumentationSession
-	sess, ok := sessInterface.(*DocumentationSession)
-	if !ok {
-		return nil, fmt.Errorf("invalid session type")
+	sess, err := o.sessionManager.Get(id)
+	if err != nil {
+		return nil, fmt.Errorf("session not found: %w", err)
 	}
 
 	// Check if session has expired
@@ -155,7 +161,41 @@ func (o *OrchestratorImpl) GetSession(ctx context.Context, sessionID string) (*D
 		return nil, fmt.Errorf("session %s has expired", sessionID)
 	}
 
-	return sess, nil
+	// Convert to DocumentationSession
+	// Map session status to workflow state
+	var state WorkflowState
+	switch sess.Status {
+	case session.StatusPending:
+		state = WorkflowStateIdle
+	case session.StatusInProgress:
+		state = WorkflowStateProcessing
+	case session.StatusCompleted:
+		state = WorkflowStateComplete
+	case session.StatusFailed:
+		state = WorkflowStateFailed
+	case session.StatusExpired:
+		state = WorkflowStateFailed // Map expired to failed
+	default:
+		state = WorkflowStateIdle
+	}
+
+	docSess := &DocumentationSession{
+		ID:          sess.GetID(),
+		WorkspaceID: sess.WorkspaceID,
+		ProjectPath: sess.ModuleName, // Using ModuleName as ProjectPath
+		State:       state,
+		Progress: SessionProgress{
+			TotalFiles:     sess.Progress.TotalFiles,
+			ProcessedFiles: sess.Progress.ProcessedFiles,
+			FailedFiles:    len(sess.Progress.FailedFiles),
+			CurrentFile:    sess.Progress.CurrentFile,
+		},
+		CreatedAt: sess.CreatedAt,
+		UpdatedAt: sess.UpdatedAt,
+		ExpiresAt: sess.ExpiresAt,
+	}
+
+	return docSess, nil
 }
 
 // ProcessNextFile processes the next file in the TODO queue for a session.
@@ -211,11 +251,18 @@ func (o *OrchestratorImpl) ProcessNextFile(ctx context.Context, sessionID string
 		ProcessedAt: time.Now(),
 	}
 
-	// Update progress and clear current file in a single update
-	sess.Progress.ProcessedFiles++
-	sess.Progress.CurrentFile = ""
-	sess.UpdatedAt = time.Now()
-	if err := o.sessionManager.Update(ctx, sess); err != nil {
+	// Update progress in session manager
+	sessionUUID, _ := uuid.Parse(sessionID)
+	progress := session.Progress{
+		TotalFiles:     sess.Progress.TotalFiles,
+		ProcessedFiles: sess.Progress.ProcessedFiles + 1,
+		CurrentFile:    "",
+		FailedFiles:    []string{},
+	}
+	
+	if err := o.sessionManager.Update(sessionUUID, session.SessionUpdate{
+		Progress: &progress,
+	}); err != nil {
 		return nil, fmt.Errorf("failed to update session progress: %w", err)
 	}
 
@@ -242,10 +289,12 @@ func (o *OrchestratorImpl) CompleteSession(ctx context.Context, sessionID string
 		return fmt.Errorf("failed to transition to complete state: %w", err)
 	}
 
-	// Update session
-	sess.State = WorkflowStateComplete
-	sess.UpdatedAt = time.Now()
-	if err := o.sessionManager.Update(ctx, sess); err != nil {
+	// Update session status to completed
+	sessionUUID, _ := uuid.Parse(sessionID)
+	completedStatus := session.StatusCompleted
+	if err := o.sessionManager.Update(sessionUUID, session.SessionUpdate{
+		Status: &completedStatus,
+	}); err != nil {
 		return fmt.Errorf("failed to update session: %w", err)
 	}
 
@@ -287,4 +336,40 @@ func validateDocumentationRequest(req DocumentationRequest) error {
 	}
 
 	return nil
+}
+
+// InitDatabase initializes a database connection pool with the provided configuration.
+// It sets up connection pooling parameters and verifies connectivity.
+func InitDatabase(cfg *DatabaseConfig) (*sql.DB, error) {
+	// Build connection string
+	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.Database, cfg.SSLMode)
+
+	// Open database connection
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database connection: %w", err)
+	}
+
+	// Configure connection pool
+	db.SetMaxOpenConns(cfg.MaxOpenConns)
+	db.SetMaxIdleConns(cfg.MaxIdleConns)
+	db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
+
+	// Verify connectivity
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	log.Info().
+		Str("host", cfg.Host).
+		Int("port", cfg.Port).
+		Str("database", cfg.Database).
+		Msg("Database connection established")
+
+	return db, nil
 }
