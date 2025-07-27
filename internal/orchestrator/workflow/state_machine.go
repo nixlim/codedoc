@@ -17,11 +17,17 @@ type Engine interface {
 	// GetState returns the current state of a workflow
 	GetState(ctx context.Context, sessionID string) (WorkflowState, error)
 
-	// Transition attempts to move the workflow to a new state
+	// Trigger executes a state transition based on an event
+	Trigger(ctx context.Context, sessionID string, event WorkflowEvent) error
+
+	// Transition attempts to move the workflow to a new state (legacy method)
 	Transition(ctx context.Context, sessionID string, newState WorkflowState) error
 
 	// ValidateTransition checks if a state transition is allowed
 	ValidateTransition(from, to WorkflowState) error
+
+	// CanTransition checks if an event can trigger a transition from current state
+	CanTransition(from WorkflowState, event WorkflowEvent) (WorkflowState, bool)
 
 	// GetHistory returns the state transition history for a session
 	GetHistory(ctx context.Context, sessionID string) ([]StateTransition, error)
@@ -44,11 +50,18 @@ type StateTransition struct {
 
 // EngineImpl implements the Engine interface with state validation.
 type EngineImpl struct {
-	states     map[string]WorkflowState
-	history    map[string][]StateTransition
-	mu         sync.RWMutex
-	config     WorkflowConfig
-	validators map[WorkflowState]StateValidator
+	states      map[string]WorkflowState
+	history     map[string][]StateTransition
+	transitions map[transitionKey]WorkflowState
+	mu          sync.RWMutex
+	config      WorkflowConfig
+	validators  map[WorkflowState]StateValidator
+}
+
+// transitionKey represents a state transition trigger.
+type transitionKey struct {
+	From  WorkflowState
+	Event WorkflowEvent
 }
 
 // StateValidator validates conditions for entering a state.
@@ -57,14 +70,18 @@ type StateValidator func(ctx context.Context, sessionID string) error
 // NewEngine creates a new workflow engine instance.
 func NewEngine(config WorkflowConfig) (Engine, error) {
 	engine := &EngineImpl{
-		states:     make(map[string]WorkflowState),
-		history:    make(map[string][]StateTransition),
-		config:     config,
-		validators: make(map[WorkflowState]StateValidator),
+		states:      make(map[string]WorkflowState),
+		history:     make(map[string][]StateTransition),
+		transitions: make(map[transitionKey]WorkflowState),
+		config:      config,
+		validators:  make(map[WorkflowState]StateValidator),
 	}
 
 	// Register state validators
 	engine.registerValidators()
+
+	// Register state transitions
+	engine.registerTransitions()
 
 	return engine, nil
 }
@@ -138,24 +155,87 @@ func (e *EngineImpl) Transition(ctx context.Context, sessionID string, newState 
 	return nil
 }
 
+// Trigger executes a state transition based on an event.
+func (e *EngineImpl) Trigger(ctx context.Context, sessionID string, event WorkflowEvent) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	currentState, exists := e.states[sessionID]
+	if !exists {
+		return fmt.Errorf("no workflow found for session %s", sessionID)
+	}
+
+	// Check if transition is valid
+	newState, canTransition := e.CanTransition(currentState, event)
+	if !canTransition {
+		return fmt.Errorf("invalid transition: %s + %s from state %s", currentState, event, currentState)
+	}
+
+	// Run state validator if exists
+	if validator, ok := e.validators[newState]; ok {
+		if err := validator(ctx, sessionID); err != nil {
+			return fmt.Errorf("state validation failed: %w", err)
+		}
+	}
+
+	// Perform transition
+	e.states[sessionID] = newState
+	e.history[sessionID] = append(e.history[sessionID], StateTransition{
+		From:      currentState,
+		To:        newState,
+		Timestamp: time.Now(),
+		Reason:    fmt.Sprintf("event %s triggered transition from %s to %s", event, currentState, newState),
+	})
+
+	return nil
+}
+
+// CanTransition checks if an event can trigger a transition from current state.
+func (e *EngineImpl) CanTransition(from WorkflowState, event WorkflowEvent) (WorkflowState, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	key := transitionKey{From: from, Event: event}
+	to, exists := e.transitions[key]
+	return to, exists
+}
+
 // ValidateTransition checks if a state transition is allowed.
 func (e *EngineImpl) ValidateTransition(from, to WorkflowState) error {
-	// Define valid transitions
+	// Updated to support new states with legacy compatibility
 	validTransitions := map[WorkflowState][]WorkflowState{
 		WorkflowStateIdle: {
-			WorkflowStateProcessing,
+			WorkflowStateInitialized,
 			WorkflowStateFailed,
+		},
+		WorkflowStateInitialized: {
+			WorkflowStateProcessing,
+			WorkflowStateCancelled,
 		},
 		WorkflowStateProcessing: {
-			WorkflowStateComplete,
+			WorkflowStateCompleted,
+			WorkflowStateComplete, // Legacy compatibility
 			WorkflowStateFailed,
+			WorkflowStatePaused,
+			WorkflowStateCancelled,
+		},
+		WorkflowStatePaused: {
+			WorkflowStateProcessing,
+			WorkflowStateCancelled,
+		},
+		WorkflowStateCompleted: {
+			// Terminal state - no transitions allowed
 		},
 		WorkflowStateComplete: {
-			// Terminal state - no transitions allowed
+			// Legacy terminal state - no transitions allowed
 		},
 		WorkflowStateFailed: {
 			// Failed workflows can be retried
-			WorkflowStateProcessing,
+			WorkflowStateInitialized,
+			WorkflowStateCancelled,
+		},
+		WorkflowStateCancelled: {
+			// Terminal state - no transitions allowed
 		},
 	}
 
@@ -192,7 +272,7 @@ func (e *EngineImpl) GetHistory(ctx context.Context, sessionID string) ([]StateT
 
 // registerValidators sets up state-specific validation logic.
 func (e *EngineImpl) registerValidators() {
-	// Example validator for processing state
+	// Validator for processing state
 	e.validators[WorkflowStateProcessing] = func(ctx context.Context, sessionID string) error {
 		// In a real implementation, this might check:
 		// - Session has files to process
@@ -201,11 +281,42 @@ func (e *EngineImpl) registerValidators() {
 		return nil
 	}
 
-	// Example validator for complete state
-	e.validators[WorkflowStateComplete] = func(ctx context.Context, sessionID string) error {
+	// Validator for completed state
+	e.validators[WorkflowStateCompleted] = func(ctx context.Context, sessionID string) error {
 		// In a real implementation, this might check:
 		// - All files have been processed
 		// - No pending operations
 		return nil
 	}
+
+	// Legacy validator for complete state
+	e.validators[WorkflowStateComplete] = func(ctx context.Context, sessionID string) error {
+		return nil
+	}
+}
+
+// registerTransitions sets up the event-driven state transitions.
+func (e *EngineImpl) registerTransitions() {
+	// Idle state transitions
+	e.transitions[transitionKey{WorkflowStateIdle, EventStart}] = WorkflowStateInitialized
+
+	// Initialized state transitions  
+	e.transitions[transitionKey{WorkflowStateInitialized, EventProcess}] = WorkflowStateProcessing
+	e.transitions[transitionKey{WorkflowStateInitialized, EventCancel}] = WorkflowStateCancelled
+
+	// Processing state transitions
+	e.transitions[transitionKey{WorkflowStateProcessing, EventComplete}] = WorkflowStateCompleted
+	e.transitions[transitionKey{WorkflowStateProcessing, EventFail}] = WorkflowStateFailed
+	e.transitions[transitionKey{WorkflowStateProcessing, EventPause}] = WorkflowStatePaused
+	e.transitions[transitionKey{WorkflowStateProcessing, EventCancel}] = WorkflowStateCancelled
+
+	// Paused state transitions
+	e.transitions[transitionKey{WorkflowStatePaused, EventResume}] = WorkflowStateProcessing
+	e.transitions[transitionKey{WorkflowStatePaused, EventCancel}] = WorkflowStateCancelled
+
+	// Failed state transitions
+	e.transitions[transitionKey{WorkflowStateFailed, EventRetry}] = WorkflowStateInitialized
+	e.transitions[transitionKey{WorkflowStateFailed, EventCancel}] = WorkflowStateCancelled
+
+	// Terminal states (completed/cancelled) have no outgoing transitions
 }

@@ -26,8 +26,9 @@ func TestIdleStateHandler(t *testing.T) {
 			targetState WorkflowState
 			expected    bool
 		}{
-			{WorkflowStateProcessing, true},
+			{WorkflowStateInitialized, true}, // New transition
 			{WorkflowStateFailed, true},
+			{WorkflowStateProcessing, false}, // No longer direct transition
 			{WorkflowStateComplete, false},
 			{WorkflowStateIdle, false},
 			{WorkflowState("unknown"), false},
@@ -151,7 +152,9 @@ func TestFailedStateHandler(t *testing.T) {
 			targetState WorkflowState
 			expected    bool
 		}{
-			{WorkflowStateProcessing, true}, // Allow retry
+			{WorkflowStateInitialized, true}, // Allow retry
+			{WorkflowStateCancelled, true},   // Allow cancellation
+			{WorkflowStateProcessing, false}, // No longer direct transition
 			{WorkflowStateIdle, false},
 			{WorkflowStateComplete, false},
 			{WorkflowStateFailed, false},

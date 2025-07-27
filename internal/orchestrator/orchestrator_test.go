@@ -100,6 +100,16 @@ func (m *mockWorkflowEngine) GetHistory(ctx context.Context, sessionID string) (
 	return args.Get(0).([]workflow.StateTransition), args.Error(1)
 }
 
+func (m *mockWorkflowEngine) Trigger(ctx context.Context, sessionID string, event workflow.WorkflowEvent) error {
+	args := m.Called(ctx, sessionID, event)
+	return args.Error(0)
+}
+
+func (m *mockWorkflowEngine) CanTransition(from workflow.WorkflowState, event workflow.WorkflowEvent) (workflow.WorkflowState, bool) {
+	args := m.Called(from, event)
+	return args.Get(0).(workflow.WorkflowState), args.Bool(1)
+}
+
 type mockTodoManager struct {
 	mock.Mock
 }

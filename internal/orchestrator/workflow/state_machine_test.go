@@ -178,43 +178,43 @@ func TestEngineTransition(t *testing.T) {
 		verifyFunc func(*testing.T, *EngineImpl)
 	}{
 		{
-			name:      "valid transition idle to processing",
+			name:      "valid transition idle to initialized",
 			sessionID: "session-123",
-			newState:  WorkflowStateProcessing,
+			newState:  WorkflowStateInitialized,
 			setupFunc: func(e *EngineImpl) {
 				e.states["session-123"] = WorkflowStateIdle
 				e.history["session-123"] = []StateTransition{}
 			},
 			wantErr: false,
 			verifyFunc: func(t *testing.T, e *EngineImpl) {
-				assert.Equal(t, WorkflowStateProcessing, e.states["session-123"])
+				assert.Equal(t, WorkflowStateInitialized, e.states["session-123"])
 				assert.Len(t, e.history["session-123"], 1)
 				assert.Equal(t, WorkflowStateIdle, e.history["session-123"][0].From)
-				assert.Equal(t, WorkflowStateProcessing, e.history["session-123"][0].To)
+				assert.Equal(t, WorkflowStateInitialized, e.history["session-123"][0].To)
 			},
 		},
 		{
-			name:      "valid transition processing to complete",
+			name:      "valid transition processing to completed",
 			sessionID: "session-456",
-			newState:  WorkflowStateComplete,
+			newState:  WorkflowStateCompleted,
 			setupFunc: func(e *EngineImpl) {
 				e.states["session-456"] = WorkflowStateProcessing
 				e.history["session-456"] = []StateTransition{}
 			},
 			wantErr: false,
 			verifyFunc: func(t *testing.T, e *EngineImpl) {
-				assert.Equal(t, WorkflowStateComplete, e.states["session-456"])
+				assert.Equal(t, WorkflowStateCompleted, e.states["session-456"])
 			},
 		},
 		{
-			name:      "invalid transition idle to complete",
+			name:      "invalid transition idle to completed",
 			sessionID: "session-789",
-			newState:  WorkflowStateComplete,
+			newState:  WorkflowStateCompleted,
 			setupFunc: func(e *EngineImpl) {
 				e.states["session-789"] = WorkflowStateIdle
 			},
 			wantErr: true,
-			errMsg:  "transition from idle to complete is not allowed",
+			errMsg:  "transition from idle to completed is not allowed",
 		},
 		{
 			name:      "session not found",
@@ -236,23 +236,23 @@ func TestEngineTransition(t *testing.T) {
 		{
 			name:      "retry from failed state",
 			sessionID: "failed-session",
-			newState:  WorkflowStateProcessing,
+			newState:  WorkflowStateInitialized,
 			setupFunc: func(e *EngineImpl) {
 				e.states["failed-session"] = WorkflowStateFailed
 				e.history["failed-session"] = []StateTransition{}
 			},
 			wantErr: false,
 			verifyFunc: func(t *testing.T, e *EngineImpl) {
-				assert.Equal(t, WorkflowStateProcessing, e.states["failed-session"])
+				assert.Equal(t, WorkflowStateInitialized, e.states["failed-session"])
 			},
 		},
 		{
 			name:      "transition with validator failure",
 			sessionID: "validator-fail",
-			newState:  WorkflowStateProcessing,
+			newState:  WorkflowStateInitialized,
 			setupFunc: func(e *EngineImpl) {
 				e.states["validator-fail"] = WorkflowStateIdle
-				e.validators[WorkflowStateProcessing] = func(ctx context.Context, sessionID string) error {
+				e.validators[WorkflowStateInitialized] = func(ctx context.Context, sessionID string) error {
 					return fmt.Errorf("validation failed")
 				}
 			},
@@ -300,9 +300,9 @@ func TestEngineValidateTransition(t *testing.T) {
 	}{
 		// Valid transitions
 		{
-			name:    "idle to processing",
+			name:    "idle to initialized",
 			from:    WorkflowStateIdle,
-			to:      WorkflowStateProcessing,
+			to:      WorkflowStateInitialized,
 			wantErr: false,
 		},
 		{
@@ -312,9 +312,9 @@ func TestEngineValidateTransition(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "processing to complete",
+			name:    "processing to completed",
 			from:    WorkflowStateProcessing,
-			to:      WorkflowStateComplete,
+			to:      WorkflowStateCompleted,
 			wantErr: false,
 		},
 		{
@@ -324,39 +324,39 @@ func TestEngineValidateTransition(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "failed to processing (retry)",
+			name:    "failed to initialized (retry)",
 			from:    WorkflowStateFailed,
-			to:      WorkflowStateProcessing,
+			to:      WorkflowStateInitialized,
 			wantErr: false,
 		},
 		// Invalid transitions
 		{
-			name:    "idle to complete",
+			name:    "idle to completed",
 			from:    WorkflowStateIdle,
-			to:      WorkflowStateComplete,
+			to:      WorkflowStateCompleted,
 			wantErr: true,
-			errMsg:  "transition from idle to complete is not allowed",
+			errMsg:  "transition from idle to completed is not allowed",
 		},
 		{
-			name:    "complete to processing",
-			from:    WorkflowStateComplete,
+			name:    "completed to processing",
+			from:    WorkflowStateCompleted,
 			to:      WorkflowStateProcessing,
 			wantErr: true,
-			errMsg:  "transition from complete to processing is not allowed",
+			errMsg:  "transition from completed to processing is not allowed",
 		},
 		{
-			name:    "complete to idle",
-			from:    WorkflowStateComplete,
+			name:    "completed to idle",
+			from:    WorkflowStateCompleted,
 			to:      WorkflowStateIdle,
 			wantErr: true,
-			errMsg:  "transition from complete to idle is not allowed",
+			errMsg:  "transition from completed to idle is not allowed",
 		},
 		{
-			name:    "failed to complete",
+			name:    "failed to completed",
 			from:    WorkflowStateFailed,
-			to:      WorkflowStateComplete,
+			to:      WorkflowStateCompleted,
 			wantErr: true,
-			errMsg:  "transition from failed to complete is not allowed",
+			errMsg:  "transition from failed to completed is not allowed",
 		},
 		{
 			name:    "unknown state",
@@ -489,7 +489,7 @@ func TestEngineConcurrency(t *testing.T) {
 			wg.Add(1)
 			go func(id string) {
 				defer wg.Done()
-				err := engine.Transition(context.Background(), id, WorkflowStateProcessing)
+				err := engine.Transition(context.Background(), id, WorkflowStateInitialized)
 				assert.NoError(t, err)
 			}(sessionID)
 		}
@@ -500,7 +500,7 @@ func TestEngineConcurrency(t *testing.T) {
 		for _, sessionID := range sessions {
 			state, err := engine.GetState(context.Background(), sessionID)
 			assert.NoError(t, err)
-			assert.Equal(t, WorkflowStateProcessing, state)
+			assert.Equal(t, WorkflowStateInitialized, state)
 		}
 	})
 

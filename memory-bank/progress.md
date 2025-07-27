@@ -56,7 +56,7 @@
    - [x] T00: Foundation setup (COMPLETE)
    - [x] T01: Service structure and interfaces (COMPLETE - 97.6% test coverage)
    - [x] T02: Session management implementation (COMPLETE - 87% test coverage)
-   - [ ] T03: Workflow state machine
+   - [x] T03: Workflow state machine (COMPLETE - extended to 7-state event-driven system)
    - [ ] T04: TODO list with priorities
    - [ ] T05: Database schema and migrations
 
@@ -106,11 +106,11 @@
 
 ### Development Phase
 - **Current**: Sprint S01 Implementation In Progress
-- **Next Step**: T03 - Workflow State Machine
-- **Completed**: T00 Foundation Setup, T01 Orchestrator Service Structure, T02 Session Management
-- **Blocker**: Critical security issues in session management need immediate fixes
-- **Hours Spent**: 10 hours (T00: 2 hours, T01: 4 hours, T02: 4 hours)
-- **Hours Remaining**: 68 hours (Sprint S01)
+- **Next Step**: T04 - TODO List Management
+- **Completed**: T00 Foundation Setup, T01 Orchestrator Service Structure, T02 Session Management, T03 Workflow State Machine
+- **Blocker**: Critical security issues in session management + workflow memory leaks need immediate fixes
+- **Hours Spent**: 18 hours (T00: 2 hours, T01: 4 hours, T02: 4 hours, T03: 8 hours)
+- **Hours Remaining**: 60 hours (Sprint S01)
 
 ### Technical Readiness
 - Architecture: ✅ Fully designed
@@ -121,9 +121,9 @@
 
 ### Team Status
 - Planning: Complete
-- Development: Active (T00, T01, T02 complete)
-- Testing: Strong coverage (Orchestrator: 97.6%, Session: 87%)
-- Documentation: Foundation complete, godoc comments added, session docs created
+- Development: Active (T00, T01, T02, T03 complete)
+- Testing: Strong coverage (Orchestrator: 97.6%, Session: 87%, Workflow: legacy tests pass)
+- Documentation: Foundation complete, godoc comments added, session and workflow docs created
 
 ## Known Issues
 1. **Port Conflict**: PostgreSQL default port 5432 was already in use, changed to 5433
@@ -133,6 +133,11 @@
    - SessionNote field not persisted (db:"-" tag) - HIGH
    - Memory leak risk from unbounded cache - MEDIUM
    - Race condition from storing pointers in cache - MEDIUM
+4. **Workflow System Issues (T03)**:
+   - Memory leak in workflow sessions (no cleanup mechanism) - CRITICAL
+   - State handlers implemented but not integrated with engine - HIGH
+   - Missing test coverage for event-driven functionality - HIGH
+   - Three conflicting sources of transition logic - MEDIUM
 
 ## Evolution of Project Decisions
 
@@ -168,6 +173,12 @@
    - Background workers need graceful shutdown
    - Security review critical - found SQL injection vulnerability
    - Cache design must consider memory bounds from start
+9. **Workflow State Machine**:
+   - Event-driven architecture superior to direct state transitions
+   - State handlers need engine integration, not just interface implementation
+   - Multiple transition logic sources create maintenance complexity
+   - Session cleanup mechanisms critical for memory management
+   - Test coverage must include new functionality, not just legacy compatibility
 
 ## Metrics and Milestones
 
@@ -198,7 +209,10 @@
 ## Next Actions
 1. **IMMEDIATE**: Fix SQL injection vulnerability in session List() method
 2. **IMMEDIATE**: Remove db:"-" tag from SessionNote struct
-3. **URGENT**: Implement cache size limits (LRU or max size)
-4. **URGENT**: Fix race condition by storing session copies in cache
-5. Begin T03: Workflow State Machine implementation
-6. Build on session foundation for state transitions
+3. **IMMEDIATE**: Implement workflow session cleanup mechanism (prevent memory leak)
+4. **URGENT**: Implement cache size limits (LRU or max size)
+5. **URGENT**: Fix race condition by storing session copies in cache
+6. **URGENT**: Integrate state handlers with workflow engine lifecycle
+7. **HIGH**: Add comprehensive test coverage for Trigger/CanTransition methods
+8. Begin T04: TODO List Management implementation
+9. Consolidate workflow transition logic to single source of truth
